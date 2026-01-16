@@ -11,13 +11,20 @@ class CheckResult:
 	is_complete: bool
 	shortest_invalid_prefix: Optional[str]
 
+@dataclass
+class SampleResult:
+    proofs: list[str]
+    attempts_used: int
+    invalid_prefixes: list[str]
 
-class LeanCARS:    
-	def __init__(self, llm, max_new_tokens: int = 512, verbose: bool = True):
+
+class LeanARS:    
+	def __init__(self, llm, max_new_tokens: int = 512, verbose: bool = True, learn: bool = True):
 		self.llm = llm
 		self.max_new_tokens = max_new_tokens
 		self.trie = Trie()
 		self.verbose = verbose
+		self.learn = learn
 	
 	def _log(self, msg: str):
 		if self.verbose:
@@ -75,50 +82,42 @@ class LeanCARS:
 		return generated_text, token_logprobs
 	
 	"""TODO: When the first token of the shortest invalid prefix is a whitespace,
-	         it becomes a bit tricky to handle. We could block a whitespace and its non-whitespace suffixes,
-             but the sampler just samples a different whitespace character (e.g., tab) and repeats the same mistake.
-             For now, we ignore this issue. But ideally, the first token of an invalid prefix should never be a whitespace?
+			 it becomes a bit tricky to handle. We could block a whitespace and its non-whitespace suffixes,
+			 but the sampler just samples a different whitespace character (e.g., tab) and repeats the same mistake.
+			 For now, we ignore this issue. But ideally, the first token of an invalid prefix should never be a whitespace?
  	"""
 	def update_from_invalid_prefix(self, invalid_prefix: str, generated_tokens: list[int]):
-		# self._log(f"[update] Invalid prefix: {repr(invalid_prefix)}")
-		# self._log(f"[update] Generated {len(generated_tokens)} tokens")
-		
-		invalid_prefix_stripped = invalid_prefix.strip()
-		if not invalid_prefix_stripped:
+		"""Block at the point where the invalid prefix ends."""
+		if not invalid_prefix or len(generated_tokens) == 0:
 			return
 		
-		node = self.trie.root
+		self._log(f"[update] Invalid prefix: {repr(invalid_prefix[:50])}")
 		
+		text = ""
+		split_idx = 0
 		for i, token in enumerate(generated_tokens):
-			if node.log_theta is None:
-				return
-			
-			decoded_token = self.llm.tokenizer.decode([token])
-			decoded_stripped = decoded_token.strip()
-			
-			if decoded_stripped and (decoded_stripped.startswith(invalid_prefix_stripped) or 
-				invalid_prefix_stripped.startswith(decoded_stripped)):
-				# self._log(f"[update] Blocking at depth {i}")
-				
-				# blocked = 0
-				for token_id in range(len(self.llm.tokenizer)):
-					decoded = self.llm.tokenizer.decode([token_id]).strip()
-					if decoded and (decoded.startswith(invalid_prefix_stripped) or 
-								invalid_prefix_stripped.startswith(decoded)):
-						node.log_theta[0, token_id] = float('-inf')
-						# blocked += 1
-				
-				# self._log(f"[update] Blocked {blocked} tokens at depth {i}")
-				self._propagate_up(node, generated_tokens[:i])
-				return
-			
+			text = self.llm.tokenizer.decode(generated_tokens[:i+1])
+			if len(text.strip()) >= len(invalid_prefix.strip()):
+				split_idx = i
+				break
+		
+		self._log(f"[update] Invalid at token {split_idx}")
+		
+		node = self.trie.root
+		for token in generated_tokens[:split_idx]:
 			if token not in node.children:
-				# self._log(f"[update] Token {token} not in children, stopping")
 				return
 			node = node.children[token]
 		
-		# self._log(f"[update] Could not find matching token")
-	
+		if node.log_theta is None:
+			return
+		
+		token_to_block = generated_tokens[split_idx]
+		node.log_theta[0, token_to_block] = float('-inf')
+		self._log(f"[update] Blocked token {token_to_block} = {repr(self.llm.tokenizer.decode([token_to_block]))}")
+		
+		self._propagate_up(node, generated_tokens[:split_idx])
+		
 	def _propagate_up(self, node: TrieNode, tokens: list[int]):
 		for i in range(len(tokens) - 1, -1, -1):
 			if node.raw_logprob is None or node.log_theta is None:
@@ -133,12 +132,12 @@ class LeanCARS:
 			node.log_theta[0, tokens[i]] = new_log_theta
 
 	"""TODO: The Lean proof checker functions as our oracle. Any prefix and its continuations we block,
-		     are dependent on the shortest invalid prefix it returns. While checking incrementally at
-             token level, sometimes an incomplete tactic produces an invalid prefix that should 
-             not be blocked ideally (it should return Optional[None] instead). We need to refine
+			 are dependent on the shortest invalid prefix it returns. While checking incrementally at
+			 token level, sometimes an incomplete tactic produces an invalid prefix that should 
+			 not be blocked ideally (it should return Optional[None] instead). We need to refine
 			 the checker to avoid such invalid prefixes. For now, we try to check at tactic boundaries
 			 (newline or semicolon) to reduce such cases. 
-    
+	
 			 We also need to profile the sampler and checker in loop to see which part acts as the bottleneck.
    
 	"""
@@ -151,7 +150,7 @@ class LeanCARS:
 		generated_tokens = []
 		node = self.trie.root
 		
-        # TODO: A lot of the EOS handling, and incremental checking needs to be cleaned
+		# TODO: A lot of the EOS handling, and incremental checking needs to be cleaned
 		with torch.no_grad():
 			for step in range(self.max_new_tokens):
 				if step % 20 == 0:
@@ -183,7 +182,6 @@ class LeanCARS:
 					node.create_child(next_token)
 				node = node.children[next_token]
 				
-				# Decode current text
 				current_text = self.llm.tokenizer.decode(generated_tokens)
 				for eos in ['<|end▁of▁sentence|>', '</s>', '<|endoftext|>']:
 					current_text = current_text.replace(eos, '')
@@ -239,24 +237,33 @@ class LeanCARS:
 		check_fn,
 		n_samples: int = 1,
 		max_attempts: int = 100,
-	) -> list[str]:
+	) -> SampleResult:
 		results = []
+		total_attempts = 0
+		invalid_prefixes_found = []
 		
 		for sample_idx in range(n_samples):
-			self._log(f"\n[sample] === Sample {sample_idx + 1}/{n_samples} ===")
+			self._log(f"\n[sample] --- Sample {sample_idx + 1}/{n_samples} ---")
 			
 			for attempt in range(max_attempts):
+				total_attempts += 1
 				self._log(f"[sample] Attempt {attempt + 1}")
 				
 				valid_proof, invalid_prefix, generated_tokens = self.generate_and_check(prompt, check_fn)
 				
 				if valid_proof:
-					self._log(f"[sample] Found valid proof")
+					self._log("[sample] Found valid proof")
 					results.append(valid_proof)
 					break
 				
 				if invalid_prefix and generated_tokens:
-					self._log(f"[sample] Learning prefix: {repr(invalid_prefix[:30])}")
-					self.update_from_invalid_prefix(invalid_prefix, generated_tokens)
+					invalid_prefixes_found.append(invalid_prefix)
+					if self.learn:
+						self._log(f"[sample] Learning prefix: {repr(invalid_prefix[:30])}")
+						self.update_from_invalid_prefix(invalid_prefix, generated_tokens)
 
-		return results
+		return SampleResult(
+			proofs=results,
+			attempts_used=total_attempts,
+			invalid_prefixes=invalid_prefixes_found,
+		)
