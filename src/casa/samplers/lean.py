@@ -1,6 +1,7 @@
+from typing import Callable as Fn, Optional
+
 import torch
 import math
-from typing import Optional
 from dataclasses import dataclass
 
 from casa.utils.oracle_trie import Trie, TrieNode
@@ -32,6 +33,13 @@ def total_pruned_mass(annotated_prefixes: list[AnnotatedInvalidPrefix]) -> float
     for prefix in annotated_prefixes:
         total_mass += prefix.probability_mass_pruned
     return total_mass
+
+
+@dataclass
+class GenerateAndCheckResult:
+    valid_proof: Optional[str]
+    invalid_prefix: Optional[str]
+    generated_tokens: list[int]
 
 
 class LeanARS:
@@ -112,6 +120,53 @@ class LeanARS:
 			 For now, we ignore this issue. But ideally, the first token of an invalid prefix should never be a whitespace?
  	"""
 
+    def update_from_generated_tokens(
+        self, generated_tokens: list[int]
+    ) -> Optional[AnnotatedInvalidPrefix]:
+        """
+        When an entire attempted proof is incorrect, one can block the entire sequence.
+        The sequence should end with an EOS token.
+        """
+        assert 0 < len(generated_tokens)
+        if generated_tokens[-1] != self.llm.tokenizer.eos_token_id:
+            return None
+
+        node = self.trie.root
+        raw_logprob_to_node = 0.0
+        adjusted_logprob_to_node = 0.0
+        for token in generated_tokens[:-1]:
+            raw_logprob_to_node += node.raw_logprob[0, token].item()
+            adjusted_logprob_to_node += (
+                node.raw_logprob[0, token].item() + node.log_theta[0, token].item()
+            )
+            node = node.children[token]
+
+        if node.log_theta is None or node.raw_logprob is None:
+            return None
+
+        token_to_block = generated_tokens[-1]
+        node_total_logprob = (
+            raw_logprob_to_node + node.raw_logprob[0, token_to_block].item()
+        )
+        adjusted_total_logprob = (
+            adjusted_logprob_to_node
+            + node.raw_logprob[0, token_to_block].item()
+            + node.log_theta[0, token_to_block].item()
+        )
+
+        node_total_prob = math.exp(node_total_logprob)
+        node_adjusted_prob = math.exp(adjusted_total_logprob)
+        node.log_theta[0, token_to_block] = float("-inf")
+        self._log(
+            f"[update] Blocked token {token_to_block} = {repr(self.llm.tokenizer.decode([token_to_block]))}"
+        )
+        self._propagate_up(node, generated_tokens[:-1])
+        return AnnotatedInvalidPrefix(
+            prefix=self.llm.tokenizer.decode(generated_tokens),
+            raw_probibility_mass=node_total_prob,
+            probability_mass_pruned=node_adjusted_prob,
+        )
+
     def update_from_invalid_prefix(
         self, invalid_prefix: str, generated_tokens: list[int]
     ) -> Optional[AnnotatedInvalidPrefix]:
@@ -140,14 +195,21 @@ class LeanARS:
         for token in generated_tokens[:split_idx]:
             if token not in node.children:
                 return None
-            node = node.children[token]
-            assert (
-                node.raw_logprob is not None and node.log_theta is not None
-            ), "Node logprobs should be set for generated tokens"
+            probs = torch.exp(node.raw_logprob[0])
+            prob_sum = probs.sum().item()
+            prob_idx_max = probs.argmax().item()
+            print(
+                f"Token: {token}, Prob sum: {prob_sum:.4f}, Max prob token: {prob_idx_max} ({probs[prob_idx_max]:.4f}) ({repr(self.llm.tokenizer.decode([prob_idx_max]))})"
+            )
             raw_logprob_to_node += node.raw_logprob[0, token].item()
+            decoded_token = self.llm.tokenizer.decode([token])
+            print(
+                f"Token: {token} ({repr(decoded_token)}), Raw logprob: {node.raw_logprob[0, token].item():.4f}, Log theta: {node.log_theta[0, token].item():.4f}"
+            )
             adjusted_logprob_to_node += (
                 node.raw_logprob[0, token] + node.log_theta[0, token]
             ).item()
+            node = node.children[token]
 
         if node.log_theta is None:
             return None
@@ -204,8 +266,8 @@ class LeanARS:
 	"""
 
     def generate_and_check(
-        self, prompt: str, check_fn
-    ) -> tuple[Optional[str], Optional[str], Optional[list[int]]]:
+        self, prompt: str, check_fn: Fn[[str], Optional[CheckResult]]
+    ) -> GenerateAndCheckResult:
         prompt_ids = self.llm.encode(prompt).to(self.llm.device)
         generated_tokens = []
         node = self.trie.root
@@ -214,7 +276,9 @@ class LeanARS:
         with torch.no_grad():
             for step in range(self.max_new_tokens):
                 if step % 20 == 0:
-                    self._log(f"[generate] Step {step}/{self.max_new_tokens}")
+                    self._log(
+                        f"[generate] Step {step}/{self.max_new_tokens}: {repr(self.llm.tokenizer.decode(generated_tokens))}..."
+                    )
 
                 input_ids = (
                     torch.cat(
@@ -239,8 +303,8 @@ class LeanARS:
                 adjusted_logprobs = raw_logprobs + node.log_theta[0].to(self.llm.device)
                 probs = torch.softmax(adjusted_logprobs, dim=-1)
 
-                if probs.sum() < 1e-10:
-                    return (None, None, None)
+                # if probs.sum() < 1e-10:
+                #     return (None, None, None)
 
                 next_token = torch.multinomial(probs, 1).item()
                 generated_tokens.append(next_token)
@@ -255,14 +319,30 @@ class LeanARS:
 
                 # Check at EOS
                 if next_token == self.llm.tokenizer.eos_token_id:
+                    print("HIT EOS!!!!")
                     # self._log(f"[generate] EOS at step {step}")
                     current_text = current_text.strip()
                     result = check_fn(current_text)
-                    if result and result.is_complete:
-                        return (current_text, None, None)
-                    elif result and not result.is_valid:
-                        return (None, result.shortest_invalid_prefix, generated_tokens)
-                    return (None, None, None)
+                    if result is None:
+                        raise ValueError(f"Checker didn't run")
+                    if result.is_valid:
+                        return GenerateAndCheckResult(
+                            valid_proof=current_text,
+                            invalid_prefix=None,
+                            generated_tokens=generated_tokens,
+                        )
+                    elif result and result.shortest_invalid_prefix is not None:
+                        return GenerateAndCheckResult(
+                            valid_proof=None,
+                            invalid_prefix=result.shortest_invalid_prefix,
+                            generated_tokens=generated_tokens,
+                        )
+                    else:
+                        return GenerateAndCheckResult(
+                            valid_proof=None,
+                            invalid_prefix=None,
+                            generated_tokens=generated_tokens,
+                        )
 
                 # TODO: Remove this check after fixing the checker (or) define better boundaries
                 last_char = current_text[-1] if current_text else ""
@@ -271,20 +351,20 @@ class LeanARS:
                     if len(current_text) > 0:
                         # self._log(f"[generate] Boundary at step {step}: {repr(current_text[:50])}")
                         result = check_fn(current_text)
-
                         if result is None:
-                            continue
+                            raise ValueError(f"Checker didn't run")
 
-                        if result.is_complete:
-                            # self._log(f"[generate] Valid at step {step}")
-                            return (current_text, None, None)
-
-                        if not result.is_valid:
-                            # self._log(f"[generate] Invalid at step {step}")
-                            return (
-                                None,
-                                result.shortest_invalid_prefix,
-                                generated_tokens,
+                        if result.is_valid:
+                            return GenerateAndCheckResult(
+                                valid_proof=current_text,
+                                invalid_prefix=None,
+                                generated_tokens=generated_tokens,
+                            )
+                        if result.shortest_invalid_prefix is not None:
+                            return GenerateAndCheckResult(
+                                valid_proof=None,
+                                invalid_prefix=result.shortest_invalid_prefix,
+                                generated_tokens=generated_tokens,
                             )
 
         # Max tokens - final check
@@ -294,23 +374,35 @@ class LeanARS:
         current_text = current_text.strip()
 
         result = check_fn(current_text)
-        if result and result.is_complete:
-            return (current_text, None, None)
-        elif result and not result.is_valid:
-            return (None, result.shortest_invalid_prefix, generated_tokens)
-
-        return (None, None, None)
+        if result is None:
+            raise ValueError(f"Checker didn't run")
+        elif result.is_valid:
+            return GenerateAndCheckResult(
+                valid_proof=current_text,
+                invalid_prefix=None,
+                generated_tokens=generated_tokens,
+            )
+        elif result.shortest_invalid_prefix is not None:
+            return GenerateAndCheckResult(
+                valid_proof=None,
+                invalid_prefix=result.shortest_invalid_prefix,
+                generated_tokens=generated_tokens,
+            )
+        else:
+            return GenerateAndCheckResult(
+                valid_proof=None, invalid_prefix=None, generated_tokens=generated_tokens
+            )
 
     def sample(
         self,
         prompt: str,
-        check_fn,
+        check_fn: Fn[[str], Optional[CheckResult]],
         n_samples: int = 1,
         max_attempts: int = 100,
     ) -> SampleResult:
-        results = []
+        results: list[str] = []
         total_attempts = 0
-        invalid_prefixes_found = []
+        invalid_prefixes_found: list[str] = []
         annotated_invalid_prefixes: list[AnnotatedInvalidPrefix] = []
 
         for sample_idx in range(n_samples):
@@ -320,23 +412,25 @@ class LeanARS:
                 total_attempts += 1
                 self._log(f"[sample] Attempt {attempt + 1}")
 
-                valid_proof, invalid_prefix, generated_tokens = self.generate_and_check(
-                    prompt, check_fn
+                result = self.generate_and_check(prompt, check_fn)
+
+                self._log(
+                    f"[sample] Generated:\n{self.llm.tokenizer.decode(result.generated_tokens)}"
                 )
 
-                if valid_proof:
+                if result.valid_proof:
                     self._log("[sample] Found valid proof")
-                    results.append(valid_proof)
+                    results.append(result.valid_proof)
                     break
 
-                if invalid_prefix and generated_tokens:
-                    invalid_prefixes_found.append(invalid_prefix)
+                if result.invalid_prefix:
+                    invalid_prefixes_found.append(result.invalid_prefix)
                     if self.learn:
                         self._log(
-                            f"[sample] Learning prefix: {repr(invalid_prefix[:30])}"
+                            f"[sample] Learning prefix: {repr(result.invalid_prefix)}"
                         )
                         maybe_annotated_prefix = self.update_from_invalid_prefix(
-                            invalid_prefix, generated_tokens
+                            result.invalid_prefix, result.generated_tokens
                         )
                         if maybe_annotated_prefix:
                             annotated_invalid_prefixes.append(maybe_annotated_prefix)
@@ -346,9 +440,22 @@ class LeanARS:
                             self._log(
                                 f"[sample] Total pruned mass so far: {total_pruned_mass(annotated_invalid_prefixes)}"
                             )
+                else:
+                    if self.learn:
+                        maybe_annotated_prefix = self.update_from_generated_tokens(
+                            result.generated_tokens
+                        )
+                        if maybe_annotated_prefix:
+                            annotated_invalid_prefixes.append(maybe_annotated_prefix)
+                            self._log(
+                                f"[sample] Annotated invalid prefix from full proof: {maybe_annotated_prefix}"
+                            )
+                            self._log(
+                                f"[sample] Total pruned mass so far: {total_pruned_mass(annotated_invalid_prefixes)}"
+                            )
 
         return SampleResult(
             proofs=results,
             attempts_used=total_attempts,
-            invalid_prefixes=invalid_prefixes_found,
+            invalid_prefixes=annotated_invalid_prefixes,
         )

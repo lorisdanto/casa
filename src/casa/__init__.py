@@ -1,7 +1,7 @@
 from casa.llm import LLM
 from casa.grammar import Grammar
 from casa.samplers.rejection import RS, ARS, RSFT, CARS
-from casa.samplers.lean import LeanCARS, CheckResult
+from casa.samplers.lean import LeanARS, CheckResult
 from casa.samplers.mcmc import MCMC
 
 __version__ = "0.1.0"
@@ -14,6 +14,6 @@ __all__ = [
     "RSFT",
     "CARS",
     "MCMC",
-    "LeanCARS",
-    "CheckResult"
+    "LeanARS",
+    "CheckResult",
 ]
