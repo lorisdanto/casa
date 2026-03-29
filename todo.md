@@ -1,4 +1,7 @@
-- [ ] Support vLLM
 - [ ] Add ASaP
-- [ ] Add a verbose mode
 - [ ] Add authors
+- [ ] Support batching
+- [ ] Add grammars and prompts for evaluation
+- [ ] Replace old samplers with new backends
+- [ ] Robust fix for vLLM and Transformers compatibility
+- [ ] Make profiling optional
