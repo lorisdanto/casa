@@ -15,33 +15,26 @@ Constrained aligned sampling algorithms for language models via CARS, MCMC, and 
 # Clone the repository
 git clone https://github.com/LargeLorisModels/casa.git
 cd casa
-
-# Create virtual environment (optional but recommended)
-python -m venv .venv
-source .venv/bin/activate
-
-# Install package in editable mode
-pip install -e .
 ```
 
-### Using uv (faster)
+### Using uv
 
 ```bash
 # Install uv if you haven't
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create environment and install
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+uv sync
 ```
 
 ## Quick Start
 
-```python
-from casa import LLM, Grammar, CARS
+CARS supports two inference backends: Transformers and vLLM.
 
-llm = LLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+### Using Transformers
+
+```python
+from casa import Grammar
+from casa.backends import TransformersBackend
+from casa.samplers.cars import CARS
 
 grammar_str = """
 start: CHARACTER " " ACTION " " LOCATION "."
@@ -50,22 +43,41 @@ ACTION: "discovered" | "protected" | "enchanted"
 LOCATION: "the castle" | "the forest" | "the treasure"
 """
 
-prompt = "Once upon a time,"
-grammar = Grammar.from_string(grammar_str, llm.tokenizer)
-sampler = CARS(llm, grammar, max_new_tokens=32, verbose=True)
-results = sampler.sample(prompt, n_samples=10, max_attempts=100)
+backend = TransformersBackend("meta-llama/Llama-3.1-8B-Instruct")
+grammar = Grammar.from_string(grammar_str, backend.tokenizer)
+sampler = CARS(backend, grammar, max_new_tokens=32, verbose=True)
+results = sampler.sample("Once upon a time,", n_samples=10, max_attempts=100)
 
-if results:
-	print("\nGenerated samples,")
-	for i, result in enumerate(results, 1):
-		print(f"  {i}. {prompt} {result.text}")
-else:
-	print("Failed to generate any samples")
+for i, result in enumerate(results, 1):
+    print(f"  {i}. {result.text}")
+```
+
+### Using vLLM
+
+```python
+from casa import Grammar
+from casa.backends import VLLMBackend
+from casa.samplers.cars import CARS
+
+grammar_str = """
+start: CHARACTER " " ACTION " " LOCATION "."
+CHARACTER: "a dragon" | "a knight" | "a wizard"
+ACTION: "discovered" | "protected" | "enchanted"
+LOCATION: "the castle" | "the forest" | "the treasure"
+"""
+
+backend = VLLMBackend("meta-llama/Llama-3.1-8B-Instruct")
+grammar = Grammar.from_string(grammar_str, backend.tokenizer)
+sampler = CARS(backend, grammar, max_new_tokens=32, verbose=True)
+results = sampler.sample("Once upon a time,", n_samples=10, max_attempts=100)
+
+for i, result in enumerate(results, 1):
+    print(f"  {i}. {result.text}")
 ```
 
 ## Example Output
 
-With `verbose=True`, you'll see the rejection samplers performance in real-time. Running above code,
+With `verbose=True`, you'll see the sampler's performance in real-time:
 
 ```
 Sample 01/10: ████████████████████████████████████████ 78 attempts
@@ -76,10 +88,10 @@ Sample 05/10: █ 1 attempts
 ...
 
 Generated samples:
-  1. Once upon a time, a dragon enchanted the castle.
-  2. Once upon a time, a dragon enchanted the forest.
-  3. Once upon a time, a dragon enchanted the forest.
- ...
+  1. a dragon enchanted the castle.
+  2. a dragon enchanted the forest.
+  3. a dragon enchanted the forest.
+  ...
 ```
 
 ## Available Samplers
