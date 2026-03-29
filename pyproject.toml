@@ -1,27 +1,27 @@
 [project]
 name = "casa"
-version = "0.1.0"
+version = "0.1.1"
 description = "Constrained Aligned Sampling Algorithms"
 
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 keywords = ["language-models", "sampling", "constrained-generation", "grammar"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.11",
 ]
 
 dependencies = [
-	"accelerate>=1.10.1",
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
-    "numpy>=1.24.0",
-    "llguidance>=0.7.0",
-    "rich>=14.1.0",
-    "xgrammar>=0.1.0"
+	"accelerate>=1.13.0",
+    "torch>=2.11.0",
+    "transformers>=5.4.0",
+    "numpy>=2.4.4",
+    "llguidance>=1.7.0",
+    "rich>=14.3.3",
+    "xgrammar>=0.1.33"
 ]
 
 [project.urls]
@@ -36,6 +36,6 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "pytest>=7.0.0",
-    "ruff>=0.0.260",
+    "pytest>=9.0.2",
+    "ruff>=0.15.8",
 ]
