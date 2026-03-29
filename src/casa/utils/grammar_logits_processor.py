@@ -1,7 +1,7 @@
 """Grammar-constrained logits processor for MCMC sampling."""
 
 import torch
-import xgrammar
+from llguidance.torch import apply_token_bitmask_inplace
 from transformers.generation.logits_process import LogitsProcessor
 
 
@@ -69,7 +69,7 @@ class GrammarLogitsProcessor(LogitsProcessor):
         
         # Apply token mask to scores
         scores = scores.clone()
-        xgrammar.apply_token_bitmask_inplace(
+        apply_token_bitmask_inplace(
             scores,
             acceptance.to(scores.device, non_blocking=True)
         )
