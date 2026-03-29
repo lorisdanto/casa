@@ -1,5 +1,4 @@
-import time
-from typing import List, Optional
+from typing import List
 import torch
 from transformers import GenerationConfig
 from transformers.generation.logits_process import (
@@ -12,11 +11,9 @@ from casa.utils.oracle_logits_processor import OracleLogitsProcessor
 from casa.utils.scoring import get_seq_logprob_from_scores
 from casa.utils.helpers import print_progress
 
+
 class RS(BaseSampler):
-    """Rejection Sampling (RS).
-    
-    Basic rejection sampling without learning from rejected samples.
-    """
+    """Rejection Sampling with profiling."""
     
     def __init__(self, llm, grammar, max_new_tokens: int = 512, verbose: bool = False):
         """Initialize RS sampler.
@@ -43,17 +40,9 @@ class RS(BaseSampler):
         n_samples: int = 1,
         max_attempts: int = 100,
     ) -> List[SamplingResult]:
-        """Generate samples using rejection sampling.
-        
-        Args:
-            prompt: Input prompt.
-            n_samples: Number of successful samples to generate.
-            max_attempts: Maximum attempts per sample.
-        """
         prompt_ids = self._encode_prompt(prompt)
         results = []
         
-        # Initialize logits processor
         logits_processor = OracleLogitsProcessor(
             tokenizer=self.llm.tokenizer,
             grammar_constraint=self.grammar.recognizer,
@@ -61,12 +50,16 @@ class RS(BaseSampler):
             learn_level=self.learn_level,
             constrain_first=self.constrain_first,
         )
+        
+        total_attempts = 0
+        
         for sample_idx in range(n_samples):
             n_attempts = 0
             success = False
             
             for attempt in range(max_attempts):
                 n_attempts += 1
+                total_attempts += 1
                 
                 try:
                     result = self._generate_one(prompt_ids, logits_processor)
@@ -78,11 +71,19 @@ class RS(BaseSampler):
                     break 
                     
                 except ValueError:
-                    continue  # Try again for this sample
+                    continue
             
             if not success:
                 print_progress(sample_idx + 1, n_samples, n_attempts, max_attempts, self.verbose, timeout=True)
-
+        
+        print(f"\n  Total attempts across all samples: {total_attempts}")
+        print(f"  Successful samples: {len(results)}")
+        if len(results) > 0:
+            print(f"  Average attempts per sample: {total_attempts / len(results):.1f}")
+        
+        logits_processor.timer.report(
+            title=f"{self.__class__.__name__} Profiling ({len(results)} samples, {total_attempts} attempts)"
+        )
         
         return results
         
@@ -122,13 +123,14 @@ class RS(BaseSampler):
         
         attention_mask = torch.ones_like(prompt_ids)
         
-        output = self.llm.model.generate(
-            prompt_ids,
-            attention_mask=attention_mask, 
-            generation_config=generation_config,
-            tokenizer=self.llm.tokenizer,
-            logits_processor=logits_processor_list,
-        )
+        with logits_processor.timer("model_generate_total", gpu_sync=True):
+            output = self.llm.model.generate(
+                prompt_ids,
+                attention_mask=attention_mask, 
+                generation_config=generation_config,
+                tokenizer=self.llm.tokenizer,
+                logits_processor=logits_processor_list,
+            )
         
         output_ids = output.sequences
         raw_logprob = logits_processor.generation_ended(output_ids)
