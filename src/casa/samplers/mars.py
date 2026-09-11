@@ -32,6 +32,14 @@ from casa.samplers.base import SamplingResult
 from casa.utils.helpers import print_progress
 from casa.utils.oracle_trie import Trie
 
+NEG_INF = float("-inf")
+
+#: How far above one a prefix's child mass may sit before it counts as a real violation rather
+#: than arithmetic. Summing a float32 log-softmax over a 150k vocabulary is off by around 5e-5 in
+#: either direction, fifty times a 1e-6 tolerance, so a tight threshold rejects every ordinary
+#: model on its first expansion. A genuine violation is a factor, not a fifth of a permille.
+_LOG_SLACK = math.log1p(1e-3)
+
 
 class MARS:
     """Exact sampling from a combination of language models.
@@ -74,7 +82,7 @@ class MARS:
         root = self.trie.root
         if root.raw_logprob is None:
             return 1.0
-        return float(torch.exp(root.raw_logprob[0] + root.log_theta[0]).sum())
+        return float(torch.exp(torch.logsumexp(root.raw_logprob[0] + root.log_theta[0], dim=0)))
 
     # -- public ------------------------------------------------------------------------------
 
@@ -93,7 +101,9 @@ class MARS:
         Returns:
             The successful samples, in order.
         """
-        resolved = prompts or self._default_prompts(prompt)
+        # Merge, do not replace. A caller overriding one model's prompt must not silently blank
+        # every other model's, which is what taking `prompts` wholesale used to do.
+        resolved = {**self._default_prompts(prompt), **(prompts or {})}
 
         # Validation and prompt tokenization happen once, in the plan. Each descent then gets a
         # fresh runtime, exactly as CARS rebuilds its cache per attempt: a descent branches and
@@ -137,7 +147,11 @@ class MARS:
 
     @property
     def acceptance_rate(self) -> float:
-        """Fraction of descents that yielded a sample. Monotone non-decreasing over a run."""
+        """Fraction of descents so far that yielded a sample.
+
+        A cumulative ratio, so it is not itself monotone; the quantity the theorem is about is
+        :attr:`root_mass`, which never increases.
+        """
         total = self.stats.descents
         return self.stats.accepted / total if total else 0.0
 
@@ -170,27 +184,39 @@ class MARS:
                 # children, which can only be smaller, and the descent survives with exactly the
                 # ratio between them. This is the only place a rejection can happen.
                 ratios = state.log_ratios()
-                node.raw_logprob = ratios.unsqueeze(0).cpu()
-                node.log_theta = torch.zeros(1, ratios.shape[-1])
-                self.stats.expansions += 1
-                pending = True
 
-                survival = float(torch.exp(ratios).sum())
-                if survival > 1.0 + 1e-6:
+                # In log space throughout. Exponentiating first underflows to exactly zero below
+                # about -104 in float32, and a zero total is indistinguishable from an impossible
+                # prefix, so a live subtree would be deleted from the support without a word.
+                log_survival = float(torch.logsumexp(ratios.double(), dim=0))
+                # Checked before anything is written. Raising after the node holds a bound but
+                # before that bound reaches its parent would leave a trie that is quietly wrong,
+                # so a caller who caught this and carried on would get biased samples forever.
+                if log_survival > _LOG_SLACK:
                     raise ValueError(
                         f"envelope condition (ii) violated at depth {depth}: the children of this "
-                        f"prefix carry {survival:.9f} of its bound, which exceeds one. The "
-                        "expression is not an envelope for the target and sampling from it would "
-                        "not be exact."
+                        f"prefix carry {math.exp(log_survival):.9f} of its bound, which exceeds "
+                        "one. The expression is not an envelope for the target and sampling from "
+                        "it would not be exact."
                     )
-                if not math.isfinite(survival) or survival <= 0.0:
+
+                node.raw_logprob = ratios.unsqueeze(0).cpu()
+                node.log_theta = torch.zeros(1, ratios.shape[-1])
+                # The gap between envelope and target at this prefix is a function of the prefix,
+                # so compute it now, while the models are materialized, rather than forcing a
+                # forward pass every time a cached descent happens to end here.
+                node.leaf_gap = (state.log_leaf_acceptance(state.eos_token_id)
+                                 if self.envelope.needs_leaf_rejection else 0.0)
+                self.stats.expansions += 1
+                pending = True
+                if math.isnan(log_survival) or log_survival == NEG_INF:
                     self._propagate(node, depth, context)
                     self.stats.dead_ends += 1
                     return None
-                if survival < 1.0 and torch.rand(()).item() > survival:
+                if log_survival < 0.0 and math.log(max(torch.rand(()).item(), 1e-300)) > log_survival:
                     self._propagate(node, depth, context)
                     self.stats.rejections += 1
-                    self.stats.rejected_mass += 1.0 - survival
+                    self.stats.rejected_mass += max(0.0, 1.0 - math.exp(log_survival))
                     return None
 
             bounds = node.raw_logprob[0] + node.log_theta[0]
@@ -205,8 +231,11 @@ class MARS:
             if token == state.eos_token_id:
                 # The envelope is exact on complete sequences, so there is nothing left to reject
                 # unless the target needed a dominating envelope in the first place.
+                log_acc = 0.0
                 if self.envelope.needs_leaf_rejection:
-                    log_acc = state.log_leaf_acceptance(token)
+                    log_acc = getattr(node, "leaf_gap", None)
+                    if log_acc is None:  # node predates the cache; pay for it once
+                        log_acc = state.log_leaf_acceptance(token)
                     self.stats.leaf_trials += 1
                     if log_acc < 0.0 and math.log(max(torch.rand(()).item(), 1e-300)) > log_acc:
                         # Propagate before giving up. An expansion made during this descent has
@@ -220,7 +249,7 @@ class MARS:
                 log_ratio_sum += float(node.raw_logprob[0, token])
                 if pending:
                     self._propagate(node, depth, context)
-                return self._result(base, context, log_ratio_sum)
+                return self._result(base, context, log_ratio_sum, log_acc)
 
             log_ratio_sum += float(node.raw_logprob[0, token])
             context.append(token)
@@ -250,29 +279,37 @@ class MARS:
             depth -= 1
             node = node.parent
         while depth > 0:
-            total = torch.log(torch.exp(node.raw_logprob[0] + node.log_theta[0]).sum())
+            total = torch.logsumexp(node.raw_logprob[0] + node.log_theta[0], dim=0)
             depth -= 1
             node = node.parent
             node.log_theta[0, context[depth]] = total
 
     def _result(self, base: "rt.EnvelopeRT", context: List[int],
-                log_ratio_sum: float) -> SamplingResult:
+                log_ratio_sum: float, log_leaf_gap: float = 0.0) -> SamplingResult:
         """Package a yielded sequence.
 
-        ``raw_logprob`` is ``log E(w$)``, the envelope's weight of the complete sequence, which by
-        condition (i) is the target's own unnormalized weight. ``constrained_logprob`` subtracts
-        the envelope at the root, giving the weight relative to the bound the run started from.
-        Neither costs a model call: both telescope out of ratios already in the trie.
+        ``raw_logprob`` is ``log phi(w$)``, the target's own unnormalized weight. The ratios stored
+        in the trie telescope to ``log E(w$)``, which equals it by condition (i) for every target
+        except the coverage regime, where MARS runs on a dominating envelope; there the difference
+        is the leaf gap, which varies from sequence to sequence and is added back here. Getting
+        that wrong makes every reweighting or divergence computed from these numbers wrong too.
+
+        ``constrained_logprob`` is the same quantity relative to the envelope at the root. Note
+        that CARS puts the descent's own log-probability in this field, which is a different thing:
+        it differs from this by the current root mass.
+
+        Neither costs a model call; both come from values already in hand.
         """
         tok = base.models[0].llm.tokenizer
         ids = context + [base.eos_token_id]
         root_w = base.log_weight()
+        log_phi = root_w + log_ratio_sum + log_leaf_gap
         return SamplingResult(
             tokens=[tok.decode([t]) for t in ids],
             token_ids=ids,
             text=tok.decode(context),
-            raw_logprob=float(root_w + log_ratio_sum),
-            constrained_logprob=float(log_ratio_sum),
+            raw_logprob=float(log_phi),
+            constrained_logprob=float(log_phi - root_w),
             success=True,
         )
 

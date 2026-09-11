@@ -100,11 +100,18 @@ class Potential(ABC):
         return Power(self, float(gamma))
 
     def __and__(self, other: "Potential") -> "Potential":
-        """Agreement. ``P & R`` is the minimum, the generalized mean at tau = -infinity."""
+        """Agreement. ``P & R`` is the minimum, the generalized mean at tau = -infinity.
+
+        The minimum is associative, so chaining is safe here, unlike ``|``.
+        """
         return Mean.of([self, _coerce(other)], tau=-math.inf)
 
     def __or__(self, other: "Potential") -> "Potential":
-        """Union. ``P | R`` is the equal-weight mixture, the generalized mean at tau = 1."""
+        """Union. ``P | R`` is the equal-weight mixture, the generalized mean at tau = 1.
+
+        Binary and left-associative, so ``P | R | S`` weighs them (0.25, 0.25, 0.5), not equally.
+        For a uniform mixture of three or more, write ``union(P, R, S)``.
+        """
         return Mean.of([self, _coerce(other)], tau=1.0)
 
     def __truediv__(self, other: "Potential") -> "Potential":
@@ -142,7 +149,7 @@ def _raise_scorer(sc: "Scorer", gamma: float) -> "Scorer":
     fn, mask = sc.fn, sc.log_mask
     return Scorer(
         fn=lambda ctx, _f=fn, _g=gamma: _f(ctx) ** _g,
-        name=sc.name if gamma == 1.0 else f"{sc.name}**{gamma:g}",
+        name=f"{sc.name}**{gamma:g}",
         prefix_monotone=sc.prefix_monotone,
         log_mask=None if mask is None
         else (lambda ctx, v, _m=mask, _g=gamma: _scale(_m(ctx, v), _g)),
@@ -519,6 +526,8 @@ def mean(terms: Sequence[Potential], tau: float, weights: Optional[Sequence[floa
 
 def intersect(*terms: Potential, weights: Optional[Sequence[float]] = None) -> Potential:
     """Weighted geometric mean, the product-of-experts target. ``tau = 0``."""
+    if not terms:
+        raise ValueError("intersect needs at least one potential")
     if weights is None:
         weights = [1.0 / len(terms)] * len(terms)
     return Product.of(*[t ** w for t, w in zip(terms, weights)])

@@ -199,7 +199,8 @@ def trie_inconsistencies(sampler, tol=1e-6):
             if child.raw_logprob is None:
                 continue  # created but never expanded; the parent still holds the original bound
             parent_says = float(torch.exp(node.log_theta[0, tokid]))
-            child_total = float(torch.exp(child.raw_logprob[0] + child.log_theta[0]).sum())
+            child_total = float(torch.exp(torch.logsumexp(
+                child.raw_logprob[0] + child.log_theta[0], dim=0)))
             if abs(parent_says - child_total) > tol * max(1.0, abs(child_total)):
                 bad.append((path + [tokid], parent_says, child_total))
             walk(child, path + [tokid])

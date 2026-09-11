@@ -211,7 +211,12 @@ class MeanRT(NodeRT):
         self.children = children
         self.weights = list(weights)
         self.tau = tau
-        self._logw = [math.log(w) if w > 0 else NEG_INF for w in self.weights]
+        if any(w <= 0 for w in self.weights):
+            raise ValueError(
+                f"generalized-mean weights must be strictly positive, got {self.weights}; a zero "
+                "weight gives -inf + inf for negative tau, which is NaN"
+            )
+        self._logw = [math.log(w) for w in self.weights]
 
     def _combine_scalar(self, vals: List[float]) -> float:
         if self.tau == -math.inf:
@@ -287,7 +292,7 @@ class ScorerRT:
             )
 
     def log_weight(self) -> float:
-        v = self.node.fn(self.context)
+        v = self.node.fn(tuple(self.context))
         return math.log(v) if v > 0 else NEG_INF
 
     def log_next_mask(self, vocab_size: int, device) -> torch.Tensor:
@@ -495,6 +500,12 @@ def plan(envelope: Envelope, prompts: Optional[Dict[int, str]] = None,
             return any(subadditive(b) for b, _ in node.terms)
         return False
 
+    if ref_tok.eos_token_id is None:
+        raise ValueError(
+            "the tokenizer has no eos_token_id, so no sequence can ever be completed and every "
+            "descent would run to the length bound and be discarded"
+        )
+
     return Plan(envelope, prompt_ids, len(ref_tok), ref_tok.eos_token_id,
                 ref.model.device, temperature, subadditive(envelope.expr))
 
@@ -528,6 +539,10 @@ class _RecognizerMask:
         self.rec = recognizer
         self.name = name
         self._path: List[int] = []
+        # A CASA Grammar holds a single recognizer and shares it. Whoever used it last may have
+        # left it part-way down a path, and an empty `_path` claims it stands at the root, so the
+        # mask for the first token would silently be some other prefix's.
+        self.rec.reset()
 
     def _sync(self, context: List[int]) -> None:
         shared = 0

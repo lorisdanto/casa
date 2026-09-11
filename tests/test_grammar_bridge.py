@@ -83,14 +83,23 @@ m1 = mask([0], VOCAB)
 check("after one token allows odd tokens only",
       [float(x) for x in m1] == [float("-inf"), 0.0, float("-inf"), 0.0, float("-inf")])
 
+print("\nConstruction rewinds the recognizer")
+rec = FakeRecognizer()
+rec.try_advance_token_ids(torch.tensor([0, 1]))   # someone else left it mid-path
+mask = _RecognizerMask(rec, "L")
+check("a shared recognizer is reset on construction", rec.path == [] and rec.resets == 1,
+      f"path={rec.path} resets={rec.resets}")
+
 print("\nExtending the path must not reset")
 rec = FakeRecognizer()
 mask = _RecognizerMask(rec, "L")
+base_resets = rec.resets
 mask([], VOCAB)
 mask([0], VOCAB)
 mask([0, 1], VOCAB)
 mask([0, 1, 2], VOCAB)
-check("four nested prefixes cost no reset", rec.resets == 0, f"resets={rec.resets}")
+check("four nested prefixes cost no further reset", rec.resets == base_resets,
+      f"resets={rec.resets - base_resets} beyond construction")
 check("each token consumed once", rec.advanced == 3, f"advanced={rec.advanced}")
 
 print("\nDiverging must reset and replay")
