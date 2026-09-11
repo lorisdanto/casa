@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from casa.algebra import Model, intersect, mean, reweight
+from casa.algebra import Model, constrain, intersect, mean, reweight
 from casa.samplers.mars import MARS
 
 ZERO, ONE, PLUS, EOS, BOS = 0, 1, 2, 3, 4
@@ -37,6 +37,13 @@ R_TABLE = {
     "plus": [0.5, 0.5, 0.0, 0.0, 0.0],
 }
 STOP = [0.0, 0.0, 0.0, 1.0, 0.0]
+
+# The same language as lang_mask, as a table, so the exact answer can be enumerated.
+mask_table_for_scorer = {
+    "start": [1.0, 0.0, 0.0, 0.0, 0.0],
+    "digit": [0.0, 0.0, 1.0, 1.0, 0.0],
+    "plus": [1.0, 0.0, 0.0, 0.0, 0.0],
+}
 
 
 def state_of(ctx):
@@ -285,6 +292,23 @@ def main():
     m = Model(FakeLLM(mask_table, tok), name="L", sub_stochastic=False)
     ok, cars_like = run("P constrained to 0(+0)*", p * m, lambda a, b: a * b,
                         tables=(P_TABLE, mask_table))
+    passed &= ok
+
+    print("\nPrefix-monotone scorer, the path a grammar takes through MARS")
+
+    def lang_mask(ctx, vocab_size):
+        # Only "0", then alternating "+" and "0", ending any time after a digit: 0(+0)*
+        allow = {PLUS, EOS} if (ctx and ctx[-1] != PLUS) else {ZERO}
+        return torch.tensor([0.0 if t in allow else float("-inf") for t in range(vocab_size)])
+
+    p_ = Model(FakeLLM(P_TABLE, tok), name="P")
+    ok, _ = run("P * L  via a Scorer", constrain(p_, lang_mask),
+                lambda a, b: a * b, tables=(P_TABLE, mask_table_for_scorer))
+    passed &= ok
+
+    p_ = Model(FakeLLM(P_TABLE, tok), name="P")
+    ok, _ = run("(P * L)**2  sharpened", constrain(p_, lang_mask) ** 2,
+                lambda a, b: a * a * b, tables=(P_TABLE, mask_table_for_scorer))
     passed &= ok
 
     print("\nOutput-only verifier: scored at the leaf, never in the trie")

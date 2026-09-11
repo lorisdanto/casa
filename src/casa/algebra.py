@@ -130,6 +130,33 @@ class Potential(ABC):
         """Every base model appearing in this expression, in order, with duplicates."""
 
 
+def _raise_scorer(sc: "Scorer", gamma: float) -> "Scorer":
+    """``g ** gamma`` is itself a scorer, so an exponent passes straight through it.
+
+    For ``gamma > 0`` the power of a prefix-monotone scorer is prefix-monotone and still lands in
+    [0, 1], which is closure item (3) again. An indicator is unchanged by it, so a constrained
+    model can be sharpened without leaving the algebra.
+    """
+    if gamma == 1.0:
+        return sc
+    fn, mask = sc.fn, sc.log_mask
+    return Scorer(
+        fn=lambda ctx, _f=fn, _g=gamma: _f(ctx) ** _g,
+        name=sc.name if gamma == 1.0 else f"{sc.name}**{gamma:g}",
+        prefix_monotone=sc.prefix_monotone,
+        log_mask=None if mask is None
+        else (lambda ctx, v, _m=mask, _g=gamma: _scale(_m(ctx, v), _g)),
+    )
+
+
+def _scale(vec, gamma: float):
+    """Multiply a log-mask by an exponent, whatever vector type it is."""
+    try:
+        return vec * gamma
+    except TypeError:
+        return [x * gamma for x in vec]
+
+
 def _combine_leaf(values: Sequence[Optional[float]]) -> Optional[float]:
     """Fold the leaf-acceptance bounds of an expression's parts into one for the whole.
 
@@ -267,20 +294,10 @@ class Product(Potential):
             elif isinstance(node, Product):
                 for sub, g in node.terms:
                     absorb(sub, gamma * g)
-                for s in node.scorers:
-                    if gamma != 1.0:
-                        raise NoEnvelope(
-                            f"scorer {s.name!r} raised to the power {gamma}: a scorer under an "
-                            "exponent is not covered by the closure proposition"
-                        )
-                    scorers.append(s)
+                for sc in node.scorers:
+                    scorers.append(_raise_scorer(sc, gamma))
             elif isinstance(node, Scorer):
-                if gamma != 1.0:
-                    raise NoEnvelope(
-                        f"scorer {node.name!r} raised to the power {gamma}: a scorer under an "
-                        "exponent is not covered by the closure proposition"
-                    )
-                scorers.append(node)
+                scorers.append(_raise_scorer(node, gamma))
             else:
                 terms.append((node, gamma))
 

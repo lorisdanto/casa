@@ -95,12 +95,15 @@ class ModelRT(NodeRT):
             pad = torch.full(logits.shape[:-1] + (self.vocab_size - logits.shape[-1],),
                              NEG_INF, device=logits.device)
             logits = torch.cat([logits, pad], dim=-1)
-        if self.temperature != 1.0:
-            logits = logits / self.temperature
         # A language model's logits become a distribution; a general potential's are already
         # log-weights and must not be renormalized, or a 0/1 mask would come back as a uniform
-        # choice among the tokens it permits.
-        return torch.log_softmax(logits, dim=-1) if self.node.sub_stochastic else logits
+        # choice among the tokens it permits. Temperature applies only to the former: rescaling an
+        # unnormalized potential would change its weights, and could lift their sum above one.
+        if not self.node.sub_stochastic:
+            return logits
+        if self.temperature != 1.0:
+            logits = logits / self.temperature
+        return torch.log_softmax(logits, dim=-1)
 
     def _materialize(self) -> None:
         if self._log_cond is not None:
@@ -134,7 +137,16 @@ class ModelRT(NodeRT):
 
     def advance(self, token: int) -> "ModelRT":
         child = ModelRT.__new__(ModelRT)
-        child.__dict__.update(self.__dict__)
+        # Shared: everything describing the model and the run. The counter is shared deliberately,
+        # so one model's calls are counted once however far the descent goes.
+        child.node = self.node
+        child.llm = self.llm
+        child.prompt_ids = self.prompt_ids
+        child.device = self.device
+        child.vocab_size = self.vocab_size
+        child.temperature = self.temperature
+        child._counter = self._counter
+        # Per-prefix, and never inherited.
         child.context = self.context + [token]
         child._log_weight = None
         child._log_cond = None
