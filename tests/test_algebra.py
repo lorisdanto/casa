@@ -85,14 +85,22 @@ check("reweight by a verifier", lambda: reweight(P, lambda ctx: 0.5, prefix_mono
 print("\nConstraints, which is where CARS lives")
 
 
-class _Rec:
-    def accepts_prefix(self, ctx):
-        return True
+def _mask(ctx, vocab_size):
+    return [0.0] * vocab_size  # everything allowed; the algebra never calls this
 
 
-check("constrain(P, L)      CARS", lambda: constrain(P, _Rec()))
-check("constrain(P*R, L)    CARS+ensemble", lambda: constrain(P * R, _Rec()))
-check("prefix-monotone scorer", lambda: P * Scorer(lambda c: 1.0, prefix_monotone=True))
+check("constrain(P, L)      CARS", lambda: constrain(P, _mask))
+check("constrain(P*R, L)    CARS+ensemble", lambda: constrain(P * R, _mask))
+check("prefix-monotone scorer",
+      lambda: P * Scorer(lambda c: 1.0, prefix_monotone=True, log_mask=_mask))
+
+print("\nA leaf requirement must reach the root, however deeply it is nested")
+S = _alg.Model(_FakeLLM("c"), name="S")
+check("min(max(P,R), S)", lambda: mean([mean([P, R], tau=math.inf), S], tau=-math.inf),
+      want_leaf=0.5)
+check("max(P,R) * S", lambda: mean([P, R], tau=math.inf) * S, want_leaf=0.5)
+check("mix(quadratic(P,R), S)", lambda: mean([mean([P, R], tau=2), S], tau=1), want_leaf=0.5)
+check("plain min(P,S) needs no leaf step", lambda: P & S)
 
 print("\nOperations with no envelope, by theorem")
 check("P ** 0.5             temper", lambda: P ** 0.5, want_ok=False)

@@ -130,6 +130,24 @@ class Potential(ABC):
         """Every base model appearing in this expression, in order, with duplicates."""
 
 
+def _combine_leaf(values: Sequence[Optional[float]]) -> Optional[float]:
+    """Fold the leaf-acceptance bounds of an expression's parts into one for the whole.
+
+    ``None`` means a part needs no acceptance step. If every part is ``None`` so is the result.
+    Otherwise the bounds multiply, since each level that reaches its target through a dominating
+    envelope contributes its own factor to the final acceptance probability. Treat the number as a
+    guide once operations are nested; the boolean, which decides whether MARS performs the step at
+    all, is what has to be right.
+    """
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    out = 1.0
+    for v in present:
+        out *= v
+    return out
+
+
 def _coerce(x) -> Potential:
     if isinstance(x, Potential):
         return x
@@ -198,15 +216,21 @@ class Scorer(Potential):
       probability equal to its score. That is leaf rejection.
 
     Attributes:
-        fn: Maps a prefix (token id sequence) to a weight in [0, 1]. For output-only scorers this
-            is called only on complete sequences.
+        fn: Maps a token id sequence to a weight in [0, 1]. For output-only scorers it is called
+            once per yielded sequence, on the generated tokens without the end-of-sequence marker,
+            and its value is the acceptance probability.
         name: Label used in diagnostics.
         prefix_monotone: Whether ``fn`` is non-increasing along prefixes.
+        log_mask: For prefix-monotone scorers, ``log_mask(context, vocab_size)`` returning
+            ``log g(ua)`` for every token as a vector. Required, because scoring a whole
+            vocabulary one Python call at a time would be silently ruinous; a grammar recognizer
+            supplies it cheaply as a token bitmask.
     """
 
     fn: Callable[[Sequence[int]], float]
     name: str = "g"
     prefix_monotone: bool = True
+    log_mask: Optional[Callable[[Sequence[int], int], object]] = None
 
     def verdict(self) -> Verdict:
         if self.prefix_monotone:
@@ -267,7 +291,11 @@ class Product(Potential):
         collected: Dict[int, Tuple[Potential, float]] = {}
         order: List[int] = []
         for node, gamma in terms:
-            key = id(node) if not isinstance(node, Model) else hash((node.name, id(node.llm), node.prompt))
+            # Merge by identity only. Merging two distinct but identical Model nodes would drop
+            # one of them from `leaves()`, and a per-model prompt keyed on the dropped node would
+            # then be silently ignored. Not merging them costs a forward pass and changes nothing
+            # about the result.
+            key = id(node)
             if key in collected:
                 base, g = collected[key]
                 collected[key] = (base, g + gamma)
@@ -282,7 +310,11 @@ class Product(Potential):
 
     def verdict(self) -> Verdict:
         if not self.terms:
-            return Verdict(True, "empty product, constant envelope")
+            return Verdict(
+                False,
+                "a target must contain at least one model; a scorer on its own has no next-token "
+                "weights to sample from",
+            )
 
         for base, gamma in self.terms:
             if gamma <= 0:
@@ -315,11 +347,10 @@ class Product(Potential):
                     f"got {gamma:g}",
                 )
 
-        leaf = None
-        for s in self.scorers:
-            sv = s.verdict()
-            if sv.leaf_acceptance is not None:
-                leaf = 0.0
+        # A leaf requirement anywhere below must reach the root. If it does not, the sampler is
+        # told no acceptance step is needed and quietly returns a biased distribution.
+        leaf = _combine_leaf([b.verdict().leaf_acceptance for b, _ in self.terms]
+                             + [sc.verdict().leaf_acceptance for sc in self.scorers])
         how = "Hoelder" if abs(total - 1.0) < 1e-12 else f"Hoelder after scaling (exponents sum to {total:g})"
         extra = f" with {len(self.scorers)} scorer factor(s)" if self.scorers else ""
         return Verdict(True, f"weighted product, closure item (1) by {how}{extra}", leaf)
@@ -367,8 +398,11 @@ class Mean(Potential):
             weights = tuple(float(w) for w in weights)
             if len(weights) != len(terms):
                 raise ValueError("weights and terms must have the same length")
-            if any(w < 0 for w in weights):
-                raise ValueError("weights must be non-negative")
+            if any(w <= 0 for w in weights):
+                # A zero weight makes c = 1 / min_k w_k infinite, so the coverage regime would have
+                # no leaf-acceptance bound, and in log space it produces -inf + inf at any token the
+                # zero-weighted model rules out. Drop the term instead of weighting it zero.
+                raise ValueError(f"weights must be strictly positive, got {weights}")
             total = sum(weights)
             if not math.isclose(total, 1.0, rel_tol=1e-9):
                 raise ValueError(f"weights must sum to 1, got {total}")
@@ -387,22 +421,27 @@ class Mean(Potential):
         return min(self.weights)
 
     def verdict(self) -> Verdict:
+        inner = []
         for t in self.terms:
             sub = t.verdict()
             if not sub.ok:
                 return sub
+            inner.append(sub.leaf_acceptance)
         if self.tau <= 1.0:
+            below = _combine_leaf(inner)
+            note = "" if below is None else "; a term below it needs a leaf acceptance step"
             return Verdict(
                 True,
                 f"generalized mean at tau={_tau(self.tau)} is concave and positively homogeneous, "
-                "hence superadditive, so the mean of envelopes is an envelope",
+                f"hence superadditive, so the mean of envelopes is an envelope{note}",
+                below,
             )
         return Verdict(
             True,
             f"generalized mean at tau={_tau(self.tau)} is subadditive, so the mean of envelopes is "
             f"not one; MARS runs on the dominating mixture with leaf acceptance at least "
             f"{self.leaf_acceptance:g}",
-            self.leaf_acceptance,
+            _combine_leaf(inner + [self.leaf_acceptance]),
         )
 
     def leaves(self) -> List[Model]:
@@ -478,19 +517,17 @@ def union(*terms: Potential, weights: Optional[Sequence[float]] = None) -> Poten
     return Mean.of(terms, tau=1.0, weights=weights)
 
 
-def constrain(p: Potential, recognizer, name: str = "L") -> Potential:
+def constrain(p: Potential, mask, name: str = "L") -> Potential:
     """Restrict ``p`` to a prefix-closed language. This is exactly the CARS target.
 
     Args:
         p: The potential to constrain.
-        recognizer: An object exposing ``accepts_prefix(token_ids) -> bool``.
+        mask: A callable ``mask(context, vocab_size)`` returning ``log g(ua)`` for every token,
+            zero on tokens the language allows and negative infinity on the rest. Build one from a
+            CASA grammar with :func:`casa.envelope_runtime.grammar_mask`.
         name: Label for diagnostics.
     """
-    return p * Scorer(
-        fn=lambda ctx: 1.0 if recognizer.accepts_prefix(ctx) else 0.0,
-        name=name,
-        prefix_monotone=True,
-    )
+    return p * Scorer(fn=lambda ctx: 1.0, name=name, prefix_monotone=True, log_mask=mask)
 
 
 def reweight(p: Potential, fn: Callable[[Sequence[int]], float], name: str = "g",

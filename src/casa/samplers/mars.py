@@ -95,13 +95,13 @@ class MARS:
         """
         resolved = prompts or self._default_prompts(prompt)
 
-        # A fresh runtime per descent, exactly as CARS rebuilds its KV cache per attempt. Key-value
-        # caches mutate in place, and a descent branches, so a runtime reused across descents would
-        # hand the second descent a cache holding the first one's tokens. Nothing is lost by this:
-        # the trie caches the envelope ratios themselves, so a revisited prefix costs no forward
-        # pass at all, which is where the saving actually comes from.
-        def fresh():
-            return rt.build(self.envelope, prompts=resolved, temperature=self.temperature)
+        # Validation and prompt tokenization happen once, in the plan. Each descent then gets a
+        # fresh runtime, exactly as CARS rebuilds its cache per attempt: a descent branches and
+        # key-value caches mutate in place, so reusing one across descents would hand the second
+        # descent a cache holding the first one's tokens. Nothing is lost, because the trie caches
+        # the envelope ratios themselves and a revisited prefix costs no forward pass at all.
+        plan = rt.plan(self.envelope, prompts=resolved, temperature=self.temperature)
+        fresh = plan.fresh
 
         # The trie belongs to the target, not to one call. Everything MARS learns about a prefix
         # stays valid for every later sample from the same target, and throwing it away between
@@ -146,13 +146,23 @@ class MARS:
     def _descend(self, fresh) -> Optional[SamplingResult]:
         t0 = time.time()
         self.stats.descents += 1
-
         base = fresh()
+        try:
+            return self._walk(base)
+        finally:
+            # Recorded once, here, rather than at each of the seven ways a descent can end.
+            self.stats.seconds += time.time() - t0
+            self.stats.model_calls += base.forward_passes()
+
+    def _walk(self, base) -> Optional[SamplingResult]:
         state = base
         node = self.trie.root
         depth = 0
         context: List[int] = []
         pending = False
+        # raw_logprob holds the pristine envelope ratio and is never rewritten (only log_theta is),
+        # so summing the chosen entries telescopes to log E(w$) - log E(root) for free.
+        log_ratio_sum = 0.0
 
         for _ in range(self.max_new_tokens):
             if node.raw_logprob is None:
@@ -166,16 +176,21 @@ class MARS:
                 pending = True
 
                 survival = float(torch.exp(ratios).sum())
+                if survival > 1.0 + 1e-6:
+                    raise ValueError(
+                        f"envelope condition (ii) violated at depth {depth}: the children of this "
+                        f"prefix carry {survival:.9f} of its bound, which exceeds one. The "
+                        "expression is not an envelope for the target and sampling from it would "
+                        "not be exact."
+                    )
                 if not math.isfinite(survival) or survival <= 0.0:
                     self._propagate(node, depth, context)
                     self.stats.dead_ends += 1
-                    self.stats.seconds += time.time() - t0
                     return None
                 if survival < 1.0 and torch.rand(()).item() > survival:
                     self._propagate(node, depth, context)
                     self.stats.rejections += 1
                     self.stats.rejected_mass += 1.0 - survival
-                    self.stats.seconds += time.time() - t0
                     return None
 
             bounds = node.raw_logprob[0] + node.log_theta[0]
@@ -183,7 +198,6 @@ class MARS:
             if not finite.any():
                 self._propagate(node, depth, context)
                 self.stats.dead_ends += 1
-                self.stats.seconds += time.time() - t0
                 return None
 
             token = int(torch.multinomial(torch.softmax(bounds, dim=-1), 1))
@@ -195,14 +209,20 @@ class MARS:
                     log_acc = state.log_leaf_acceptance(token)
                     self.stats.leaf_trials += 1
                     if log_acc < 0.0 and math.log(max(torch.rand(()).item(), 1e-300)) > log_acc:
+                        # Propagate before giving up. An expansion made during this descent has
+                        # tightened a bound, and leaving that out of the ancestors would let the
+                        # parent keep over-weighting this subtree with no rejection to pay for it,
+                        # which biases every later descent.
+                        if pending:
+                            self._propagate(node, depth, context)
                         self.stats.leaf_rejections += 1
-                        self.stats.seconds += time.time() - t0
                         return None
+                log_ratio_sum += float(node.raw_logprob[0, token])
                 if pending:
                     self._propagate(node, depth, context)
-                self.stats.seconds += time.time() - t0
-                return self._result(base, context, state)
+                return self._result(base, context, log_ratio_sum)
 
+            log_ratio_sum += float(node.raw_logprob[0, token])
             context.append(token)
             state = state.advance(token)
             if token not in node.children:
@@ -214,7 +234,6 @@ class MARS:
         if pending:
             self._propagate(node, depth, context)
         self.stats.length_cutoffs += 1
-        self.stats.seconds += time.time() - t0
         return None
 
     def _propagate(self, node, depth: int, context: List[int]) -> None:
@@ -224,6 +243,12 @@ class MARS:
         because ``raw_logprob`` already holds the full envelope ratio, so the parent's entry for
         this child is its bound and nothing else.
         """
+        # A node created but never expanded holds no bound of its own; its parent's entry for it
+        # is still the original envelope value, so there is nothing to push up from it. This
+        # happens whenever a descent stops on the length bound.
+        while node.raw_logprob is None and depth > 0:
+            depth -= 1
+            node = node.parent
         while depth > 0:
             total = torch.log(torch.exp(node.raw_logprob[0] + node.log_theta[0]).sum())
             depth -= 1
@@ -231,15 +256,23 @@ class MARS:
             node.log_theta[0, context[depth]] = total
 
     def _result(self, base: "rt.EnvelopeRT", context: List[int],
-                final: "rt.EnvelopeRT") -> SamplingResult:
+                log_ratio_sum: float) -> SamplingResult:
+        """Package a yielded sequence.
+
+        ``raw_logprob`` is ``log E(w$)``, the envelope's weight of the complete sequence, which by
+        condition (i) is the target's own unnormalized weight. ``constrained_logprob`` subtracts
+        the envelope at the root, giving the weight relative to the bound the run started from.
+        Neither costs a model call: both telescope out of ratios already in the trie.
+        """
         tok = base.models[0].llm.tokenizer
         ids = context + [base.eos_token_id]
+        root_w = base.log_weight()
         return SamplingResult(
             tokens=[tok.decode([t]) for t in ids],
             token_ids=ids,
             text=tok.decode(context),
-            raw_logprob=float(final.log_weight()),
-            constrained_logprob=float(final.log_weight() - base.log_weight()),
+            raw_logprob=float(root_w + log_ratio_sum),
+            constrained_logprob=float(log_ratio_sum),
             success=True,
         )
 
@@ -249,7 +282,7 @@ class _Stats:
 
     __slots__ = ("descents", "accepted", "expansions", "rejections", "rejected_mass",
                  "leaf_trials", "leaf_rejections", "dead_ends", "length_cutoffs",
-                 "timeouts", "seconds")
+                 "timeouts", "seconds", "model_calls")
 
     def __init__(self):
         self.descents = 0
@@ -263,6 +296,7 @@ class _Stats:
         self.length_cutoffs = 0
         self.timeouts = 0
         self.seconds = 0.0
+        self.model_calls = 0
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}

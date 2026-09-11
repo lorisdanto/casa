@@ -18,25 +18,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from casa.algebra import Model, intersect, mean
+from casa.algebra import Model, intersect, mean, reweight
 from casa.samplers.mars import MARS
 
-ZERO, ONE, PLUS, EOS = 0, 1, 2, 3
-VOCAB = 4
+ZERO, ONE, PLUS, EOS, BOS = 0, 1, 2, 3, 4
+VOCAB = 5
 MAX_BODY = 5  # after this many tokens both models emit end-of-sequence with probability one
 
 # State depends only on the last token, exactly as in the paper's table.
 P_TABLE = {
-    "start": [0.4, 0.3, 0.3, 0.0],
-    "digit": [0.1, 0.1, 0.5, 0.3],
-    "plus": [0.5, 0.4, 0.1, 0.0],
+    "start": [0.4, 0.3, 0.3, 0.0, 0.0],
+    "digit": [0.1, 0.1, 0.5, 0.3, 0.0],
+    "plus": [0.5, 0.4, 0.1, 0.0, 0.0],
 }
 R_TABLE = {
-    "start": [0.5, 0.5, 0.0, 0.0],
-    "digit": [0.0, 0.0, 0.4, 0.6],
-    "plus": [0.5, 0.5, 0.0, 0.0],
+    "start": [0.5, 0.5, 0.0, 0.0, 0.0],
+    "digit": [0.0, 0.0, 0.4, 0.6, 0.0],
+    "plus": [0.5, 0.5, 0.0, 0.0, 0.0],
 }
-STOP = [0.0, 0.0, 0.0, 1.0]
+STOP = [0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 def state_of(ctx):
@@ -51,7 +51,7 @@ def row(table, ctx):
 
 class FakeTokenizer:
     eos_token_id = EOS
-    _vocab = {"0": ZERO, "1": ONE, "+": PLUS, "$": EOS}
+    _vocab = {"0": ZERO, "1": ONE, "+": PLUS, "$": EOS, "<s>": BOS}
 
     def __len__(self):
         return VOCAB
@@ -60,7 +60,9 @@ class FakeTokenizer:
         return dict(self._vocab)
 
     def encode(self, text, add_special_tokens=False):
-        return []
+        # A one-token prompt. A forward pass gives the conditional for a token only from the
+        # position before it, so the first generated token needs something to its left.
+        return [BOS]
 
     def decode(self, ids):
         inv = {v: k for k, v in self._vocab.items()}
@@ -68,7 +70,7 @@ class FakeTokenizer:
 
 
 class FakeModel:
-    """Returns table logits. The cache carries the full id list so the table can be indexed."""
+    """Table logits at every position, as a real causal model returns."""
 
     device = torch.device("cpu")
 
@@ -76,20 +78,19 @@ class FakeModel:
         self.table = table
         self.calls = 0
 
-    def __call__(self, input_ids, past_key_values=None, use_cache=True):
+    def __call__(self, input_ids, past_key_values=None, use_cache=False):
         self.calls += 1
-        prior = list(past_key_values) if past_key_values else []
-        new = input_ids[0].tolist()
-        ids = prior + new
-        probs = torch.tensor(row(self.table, ids), dtype=torch.float32)
-        logits = torch.log(probs.clamp_min(1e-30)).view(1, 1, VOCAB)
+        ids = input_ids[0].tolist()
+        # Position j predicts token j+1 given ids[:j+1]; ids[0] is the prompt token.
+        rows = [row(self.table, ids[1:j + 1]) for j in range(len(ids))]
+        logits = torch.log(torch.tensor(rows, dtype=torch.float32).clamp_min(1e-30)).unsqueeze(0)
 
         class Out:
             pass
 
         out = Out()
         out.logits = logits
-        out.past_key_values = ids
+        out.past_key_values = None
         return out
 
 
@@ -103,7 +104,7 @@ class FakeLLM:
         return ""
 
 
-def enumerate_target(op, table_a=None, table_b=None):
+def enumerate_target(op, table_a=None, table_b=None, post=None):
     """Exact weights of every complete sequence, as a dict from token tuple to weight."""
     table_a = P_TABLE if table_a is None else table_a
     table_b = R_TABLE if table_b is None else table_b
@@ -118,6 +119,8 @@ def enumerate_target(op, table_a=None, table_b=None):
             np_, nr = lp * p, lr * r
             if tok == EOS:
                 w = op(np_, nr)
+                if post is not None:
+                    w *= post(tuple(ctx))
                 if w > 0:
                     out[tuple(ctx)] = out.get(tuple(ctx), 0.0) + w
             elif len(ctx) < MAX_BODY:
@@ -143,7 +146,7 @@ def noise_floor(exact, n):
     return 0.5 * sum(math.sqrt(2 * p * (1 - p) / (math.pi * n)) for p in exact.values())
 
 
-def run(label, target, op, n=20_000, seed=0, slack=3.0, tables=None):
+def run(label, target, op, n=12_000, seed=0, slack=3.0, tables=None, post=None):
     torch.manual_seed(seed)
     sampler = MARS(target, max_new_tokens=MAX_BODY + 1)
     results = sampler.sample("", n_samples=n, max_attempts=10_000)
@@ -151,7 +154,7 @@ def run(label, target, op, n=20_000, seed=0, slack=3.0, tables=None):
     counts = Counter(tuple(r.token_ids[:-1]) for r in results)
     emp = {k: v / len(results) for k, v in counts.items()}
 
-    weights = enumerate_target(op, *(tables or (None, None)))
+    weights = enumerate_target(op, *(tables or (None, None)), post=post)
     z = sum(weights.values())
     exact = {k: v / z for k, v in weights.items()}
 
@@ -167,6 +170,35 @@ def run(label, target, op, n=20_000, seed=0, slack=3.0, tables=None):
             print(f"           {''.join('01+'[t] for t in k) or '(empty)':10s} "
                   f"exact={exact[k]:.4f} emp={emp.get(k, 0.0):.4f}")
     return ok, sampler
+
+
+def trie_inconsistencies(sampler, tol=1e-6):
+    """Every parent's bound on a child must equal that child's own total.
+
+    Precisely: the parent's *correction* term for a child must equal that child's total. The
+    parent's full entry, correction plus ratio, is the child's mass relative to the parent, which
+    is a different quantity and is not what propagation writes.
+
+    This is the invariant propagation exists to maintain, and it holds globally once any descent
+    has finished, because propagation walks all the way to the root. Checking it directly catches
+    a missed propagation that a distribution test would only see as a faint bias, if at all.
+    """
+    bad = []
+
+    def walk(node, path):
+        if node.raw_logprob is None:
+            return
+        for tokid, child in node.children.items():
+            if child.raw_logprob is None:
+                continue  # created but never expanded; the parent still holds the original bound
+            parent_says = float(torch.exp(node.log_theta[0, tokid]))
+            child_total = float(torch.exp(child.raw_logprob[0] + child.log_theta[0]).sum())
+            if abs(parent_says - child_total) > tol * max(1.0, abs(child_total)):
+                bad.append((path + [tokid], parent_says, child_total))
+            walk(child, path + [tokid])
+
+    walk(sampler.trie.root, [])
+    return bad
 
 
 def main():
@@ -247,13 +279,85 @@ def main():
     print("\nReduction to CARS: a hard constraint gives the constrained LM distribution")
     # R is already an indicator-like model in structure; build a genuine mask instead.
     torch.manual_seed(3)
-    mask_table = {"start": [1.0, 0.0, 0.0, 0.0], "digit": [0.0, 0.0, 1.0, 1.0],
-                  "plus": [1.0, 0.0, 0.0, 0.0]}
+    mask_table = {"start": [1.0, 0.0, 0.0, 0.0, 0.0], "digit": [0.0, 0.0, 1.0, 1.0, 0.0],
+                  "plus": [1.0, 0.0, 0.0, 0.0, 0.0]}
     p = Model(FakeLLM(P_TABLE, tok), name="P")
     m = Model(FakeLLM(mask_table, tok), name="L", sub_stochastic=False)
     ok, cars_like = run("P constrained to 0(+0)*", p * m, lambda a, b: a * b,
                         tables=(P_TABLE, mask_table))
     passed &= ok
+
+    print("\nOutput-only verifier: scored at the leaf, never in the trie")
+
+    def verifier(ctx):
+        # Depends on the whole sequence, so it cannot tighten any prefix bound.
+        return 0.25 if len(ctx) % 2 else 1.0
+
+    p = Model(FakeLLM(P_TABLE, tok), name="P")
+    ok, ver = run("P reweighted by a verifier", reweight(p, verifier, prefix_monotone=False),
+                  lambda a, b: a, tables=(P_TABLE, P_TABLE), post=verifier)
+    passed &= ok
+    if ver.stats.leaf_trials == 0:
+        print("  FAIL   the verifier was never consulted")
+        passed = False
+    else:
+        print(f"         consulted at {ver.stats.leaf_trials} leaves, "
+              f"{ver.stats.leaf_rejections} rejected")
+
+    print("\nTrie consistency: every parent's bound equals its child's total")
+    for label, target, seed in [
+        ("intersect", None, 10),
+        ("max, leaf rejection", None, 11),
+    ]:
+        torch.manual_seed(seed)
+        a = Model(FakeLLM(P_TABLE, tok), name="P")
+        b = Model(FakeLLM(R_TABLE, tok), name="R")
+        expr = intersect(a, b) if label == "intersect" else mean([a, b], tau=math.inf)
+        sm = MARS(expr, max_new_tokens=MAX_BODY + 1)
+        sm.sample("", n_samples=1500, max_attempts=10_000)
+        bad = trie_inconsistencies(sm)
+        print(f"  {'ok    ' if not bad else 'FAIL  '}{label:28s} "
+              f"{len(bad)} inconsistent edge(s) over {sm.stats.expansions} expansions")
+        for path, ps, ct in bad[:3]:
+            print(f"           path={path} parent says {ps:.9f}, child holds {ct:.9f}")
+        passed &= not bad
+
+    print("\nCaching: a revisited prefix must cost no model call")
+    torch.manual_seed(4)
+    p = Model(FakeLLM(P_TABLE, tok), name="P")
+    r = Model(FakeLLM(R_TABLE, tok), name="R")
+    sampler = MARS(intersect(p, r), max_new_tokens=MAX_BODY + 1)
+    sampler.sample("", n_samples=2000, max_attempts=10_000)
+    calls = sampler.stats.model_calls
+    raw = p.llm.model.calls + r.llm.model.calls
+    if calls != raw:
+        print(f"  FAIL   stats.model_calls={calls} disagrees with the models' own count {raw}")
+        passed = False
+    # Two models, one pass each per expanded node, plus one per leaf-weight query. If advancing
+    # through cached nodes were still asking the models, this would scale with total descent
+    # length instead, which is orders of magnitude larger.
+    budget = 2 * sampler.stats.expansions + 8
+    ok_cache = calls <= budget
+    print(f"  {'ok    ' if ok_cache else 'FAIL  '}model calls {calls} for "
+          f"{sampler.stats.expansions} expansions over {sampler.stats.descents} descents "
+          f"(budget {budget})")
+    passed &= ok_cache
+
+    print("\nLength cutoff: a descent that never terminates must not crash")
+    torch.manual_seed(5)
+    # max_new_tokens below the forced-stop depth, so every descent runs out of room.
+    p = Model(FakeLLM(P_TABLE, tok), name="P")
+    r = Model(FakeLLM(R_TABLE, tok), name="R")
+    short = MARS(intersect(p, r), max_new_tokens=2)
+    try:
+        got = short.sample("", n_samples=3, max_attempts=50)
+        ok_cut = short.stats.length_cutoffs > 0
+        print(f"  {'ok    ' if ok_cut else 'FAIL  '}survived {short.stats.length_cutoffs} cutoffs, "
+              f"{len(got)} sample(s), {short.stats.timeouts} timeout(s)")
+        passed &= ok_cut
+    except Exception as e:  # noqa: BLE001
+        print(f"  FAIL  raised {type(e).__name__}: {e}")
+        passed = False
 
     print()
     print("all exactness checks passed" if passed else "FAILURES")
