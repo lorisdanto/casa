@@ -337,6 +337,38 @@ class EnvelopeRT:
             return torch.full((self.vocab_size,), NEG_INF)
         return self.root.log_next() - w
 
+    def forced_stop_ratios(self) -> torch.Tensor:
+        """Ratios for a prefix that has reached the length bound: stop, with probability one.
+
+        The paper's model assumes the end-of-sequence marker is almost surely produced, and says
+        this can be enforced with a maximum length. Enforcing it is what this is. Without it, a
+        model that simply does not want to stop yet, which is every language model a few tokens
+        into a sentence, sends every descent into the length bound to be discarded, and a run
+        returns nothing at all after doing all the work.
+        """
+        out = torch.full((self.vocab_size,), NEG_INF)
+        out[self.eos_token_id] = 0.0
+        return out
+
+    def log_truncation_acceptance(self) -> float:
+        """``log phi(u) - log E(u)`` when the sequence is stopped at the bound.
+
+        The analogue of :meth:`log_leaf_acceptance` for a forced stop, where the sequence's weight
+        is the *prefix* weight rather than the weight of a prefix followed by the marker.
+        """
+        gap = 0.0
+        for sc in self.leaf_scorers:
+            v = sc.fn(self.context)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(
+                    f"scorer {sc.name!r} returned {v}, which is outside [0, 1]; it cannot be used "
+                    "as an acceptance probability"
+                )
+            gap += math.log(v) if v > 0 else NEG_INF
+        if self.dominating:
+            gap += _true_weight(self.root) - self.root.log_weight()
+        return min(gap, 0.0)
+
     def log_leaf_acceptance(self, token: int) -> float:
         """``log phi(w$) - log E(w$)`` for a yielded complete sequence.
 
@@ -380,6 +412,18 @@ class EnvelopeRT:
     def forward_passes(self) -> int:
         """Total model calls so far, across every model in the expression."""
         return sum(c["passes"] for c in self.counters.values())
+
+
+def _true_weight(node: NodeRT) -> float:
+    """The target's prefix weight, which differs from the envelope's only under a subadditive mean."""
+    if isinstance(node, MeanRT):
+        return node._combine_scalar([_true_weight(c) for c in node.children])
+    if isinstance(node, PowerRT):
+        return node.gamma * _true_weight(node.child)
+    if isinstance(node, ProductRT):
+        w = sum(g * _true_weight(c) for c, g in node.terms)
+        return w + sum(sc.log_weight() for sc in node.scorers)
+    return node.log_weight()
 
 
 def _true_next(node: NodeRT) -> torch.Tensor:

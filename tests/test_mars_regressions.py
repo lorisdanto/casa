@@ -204,9 +204,18 @@ class SmallLLM:
         return ""
 
 
-def weight(table, seq):
+MAXLEN = 4
+
+
+def weight(table, seq, stopped):
+    """Weight of a complete sequence.
+
+    A sequence that ended because the model produced the marker pays for that token. One that was
+    stopped at the length bound does not: MARS forces termination there, so its weight is the
+    prefix weight, which is the truncated model the paper assumes.
+    """
     w, ctx = 1.0, []
-    for t in list(seq) + [EOS]:
+    for t in list(seq) + ([] if stopped else [EOS]):
         w *= table[state(ctx)][t]
         ctx.append(t)
     return w
@@ -216,13 +225,14 @@ stk = SmallTok()
 p = Model(SmallLLM(PT, stk), name="P")
 r = Model(SmallLLM(RT, stk), name="R")
 torch.manual_seed(0)
-cov = MARS(mean([p, r], tau=math.inf), max_new_tokens=4)
+cov = MARS(mean([p, r], tau=math.inf), max_new_tokens=MAXLEN)
 res = cov.sample("", n_samples=250, max_attempts=500)
 
 worst, shown = 0.0, []
 for s in res:
     seq = tuple(s.token_ids[:-1])
-    want = math.log(max(weight(PT, seq), weight(RT, seq)))   # tau = +inf is the maximum
+    stopped = len(seq) >= MAXLEN                              # forced termination at the bound
+    want = math.log(max(weight(PT, seq, stopped), weight(RT, seq, stopped)))  # tau=+inf is max
     worst = max(worst, abs(s.raw_logprob - want))
     if len(shown) < 3 and abs(s.raw_logprob - want) > 1e-6:
         shown.append((seq, s.raw_logprob, want))
@@ -244,7 +254,7 @@ print("\nThe coverage regime must not pay a forward pass per yielded sequence")
 torch.manual_seed(1)
 p2 = Model(SmallLLM(PT, stk), name="P")
 r2 = Model(SmallLLM(RT, stk), name="R")
-perf = MARS(mean([p2, r2], tau=math.inf), max_new_tokens=4)
+perf = MARS(mean([p2, r2], tau=math.inf), max_new_tokens=MAXLEN)
 perf.sample("", n_samples=400, max_attempts=500)
 budget = 2 * perf.stats.expansions + 8
 check("model calls stay proportional to expansions, not to leaves",

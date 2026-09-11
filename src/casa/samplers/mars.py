@@ -48,20 +48,33 @@ class MARS:
         target: A :class:`casa.algebra.Envelope`, or a :class:`casa.algebra.Potential` which is
             validated on the spot. Passing a potential with no envelope raises ``NoEnvelope``,
             naming the obstruction.
-        max_new_tokens: Length bound. Reaching it without an end-of-sequence token is a failure,
-            not a sample, so the distribution is not truncated silently.
+        max_new_tokens: Length bound.
         verbose: Print a progress line per sample.
         temperature: Applied to every model's logits before the envelope is formed.
+        on_max_length: What a prefix that reaches the bound does.
+
+            ``"stop"`` (the default) ends it, as if the models had produced the end-of-sequence
+            marker with probability one. The target is then the combination truncated to this
+            length, which is the model the paper assumes when it says termination can be enforced
+            by a maximum length.
+
+            ``"discard"`` throws the descent away instead. That is also exact, for the target
+            conditioned on terminating within the bound, but every language model a few tokens
+            into a sentence wants to keep going, so nearly every descent is wasted and a short
+            bound can return nothing at all after doing all the work.
     """
 
     def __init__(self, target, max_new_tokens: int = 512, verbose: bool = False,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0, on_max_length: str = "stop"):
         self.envelope: Envelope = target.envelope() if isinstance(target, Potential) else target
         if not isinstance(self.envelope, Envelope):
             raise TypeError(f"expected an Envelope or Potential, got {type(target).__name__}")
         self.max_new_tokens = max_new_tokens
         self.verbose = verbose
         self.temperature = temperature
+        if on_max_length not in ("stop", "discard"):
+            raise ValueError(f"on_max_length must be 'stop' or 'discard', got {on_max_length!r}")
+        self.on_max_length = on_max_length
         self.trie = Trie()
         self.stats = _Stats()
         self._key = None
@@ -178,12 +191,14 @@ class MARS:
         # so summing the chosen entries telescopes to log E(w$) - log E(root) for free.
         log_ratio_sum = 0.0
 
-        for _ in range(self.max_new_tokens):
+        stop_at_bound = self.on_max_length == "stop"
+        for _ in range(self.max_new_tokens + (1 if stop_at_bound else 0)):
+            at_bound = stop_at_bound and len(context) >= self.max_new_tokens
             if node.raw_logprob is None:
                 # First visit: expand. The node's bound E(u) is replaced by the total mass of its
                 # children, which can only be smaller, and the descent survives with exactly the
                 # ratio between them. This is the only place a rejection can happen.
-                ratios = state.log_ratios()
+                ratios = state.forced_stop_ratios() if at_bound else state.log_ratios()
 
                 # In log space throughout. Exponentiating first underflows to exactly zero below
                 # about -104 in float32, and a zero total is indistinguishable from an impossible
@@ -205,8 +220,14 @@ class MARS:
                 # The gap between envelope and target at this prefix is a function of the prefix,
                 # so compute it now, while the models are materialized, rather than forcing a
                 # forward pass every time a cached descent happens to end here.
-                node.leaf_gap = (state.log_leaf_acceptance(state.eos_token_id)
-                                 if self.envelope.needs_leaf_rejection else 0.0)
+                if not self.envelope.needs_leaf_rejection:
+                    node.leaf_gap = 0.0
+                elif at_bound:
+                    # Stopped here, so the sequence's weight is this prefix's weight, not the
+                    # weight of this prefix followed by the marker.
+                    node.leaf_gap = state.log_truncation_acceptance()
+                else:
+                    node.leaf_gap = state.log_leaf_acceptance(state.eos_token_id)
                 self.stats.expansions += 1
                 pending = True
                 if math.isnan(log_survival) or log_survival == NEG_INF:

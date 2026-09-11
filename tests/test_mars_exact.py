@@ -329,6 +329,19 @@ def main():
         print(f"         consulted at {ver.stats.leaf_trials} leaves, "
               f"{ver.stats.leaf_rejections} rejected")
 
+    print("\nForced termination at the bound is the default")
+    torch.manual_seed(6)
+    p = Model(FakeLLM(P_TABLE, tok), name="P")
+    r = Model(FakeLLM(R_TABLE, tok), name="R")
+    stopper = MARS(intersect(p, r), max_new_tokens=2)
+    got = stopper.sample("", n_samples=20, max_attempts=500)
+    lens = {len(g.token_ids) - 1 for g in got}
+    ok_stop = len(got) == 20 and stopper.stats.length_cutoffs == 0 and max(lens) <= 2
+    print(f"  {'ok    ' if ok_stop else 'FAIL  '}every descent yields, none discarded   "
+          f"{len(got)}/20 samples, lengths {sorted(lens)}, "
+          f"{stopper.stats.length_cutoffs} cutoffs")
+    passed &= ok_stop
+
     print("\nTrie consistency: every parent's bound equals its child's total")
     for label, target, seed in [
         ("intersect", None, 10),
@@ -368,12 +381,12 @@ def main():
           f"(budget {budget})")
     passed &= ok_cache
 
-    print("\nLength cutoff: a descent that never terminates must not crash")
+    print("\nLength cutoff: discarding at the bound must not crash")
     torch.manual_seed(5)
-    # max_new_tokens below the forced-stop depth, so every descent runs out of room.
+    # on_max_length="discard" is the mode that throws the descent away; the default stops instead.
     p = Model(FakeLLM(P_TABLE, tok), name="P")
     r = Model(FakeLLM(R_TABLE, tok), name="R")
-    short = MARS(intersect(p, r), max_new_tokens=2)
+    short = MARS(intersect(p, r), max_new_tokens=2, on_max_length="discard")
     try:
         got = short.sample("", n_samples=3, max_attempts=50)
         ok_cut = short.stats.length_cutoffs > 0
