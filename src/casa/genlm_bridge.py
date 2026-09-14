@@ -43,6 +43,30 @@ from casa.algebra import Envelope, Potential as AlgebraPotential
 
 NEG_INF = float("-inf")
 
+# Stand-in for -inf on the end-of-sequence entry of a dead-end prefix; see `vocab_eos_weights`.
+DEAD_END_LOG_WEIGHT = -1e300
+
+
+def vocab_eos_weights(ratios: torch.Tensor, eos: int) -> torch.Tensor:
+    """A ratio vector in genlm's ``vocab_eos`` order, safe for its sampler.
+
+    genlm orders every token except EOS by id, then EOS last. A particle can reach a prefix where
+    nothing may follow: every grammar-allowed continuation has zero target weight, and so does
+    stopping. All entries are then -inf, genlm's normalization turns them into NaN, and its
+    Gumbel-max draw over NaN returns index 0 every time. The particle is extended by token 0,
+    which the grammar rejects, and the run dies with "rejected a prefix MARS had already
+    accepted" -- four CARS grammar rows were lost this way.
+
+    The particle's weight is zero either way; what matters is that it ends rather than walking on.
+    So such a vector puts a finite but negligible weight on EOS alone: genlm stops the particle
+    with log weight ``DEAD_END_LOG_WEIGHT``, which contributes nothing next to any live particle
+    and is dropped at resampling. Every other vector is returned unchanged.
+    """
+    ws = torch.cat([ratios[:eos], ratios[eos + 1:], ratios[eos: eos + 1]]).to(torch.float64)
+    if not torch.isfinite(ws).any():
+        ws[-1] = DEAD_END_LOG_WEIGHT
+    return ws
+
 
 def _require_genlm():
     try:
@@ -117,6 +141,8 @@ def _make_impl(base):
             self._hits = 0
             self._misses = 0
             self._evictions = 0
+            # Particles stopped at a prefix with no valid continuation (see vocab_eos_weights).
+            self._dead_ends = 0
             # One counter across every runtime this potential builds, so the cost reported for the
             # baseline is what it actually spent rather than what its last prefix spent.
             self._counters: Dict[int, Dict[str, int]] = {}
@@ -172,12 +198,10 @@ def _make_impl(base):
             to at most one, and the shortfall is the rejection mass MARS pays; SMC folds the same
             quantity into an importance weight instead.
             """
-            ratios = self._at(context).log_ratios()
-            # vocab_eos order: every token except EOS, in id order, then EOS last.
-            ws = torch.cat([ratios[: self._eos],
-                            ratios[self._eos + 1:],
-                            ratios[self._eos: self._eos + 1]])
-            return self.make_lazy_weights(ws.to(torch.float64).cpu().numpy())
+            ws = vocab_eos_weights(self._at(context).log_ratios(), self._eos)
+            if ws[-1] == DEAD_END_LOG_WEIGHT:
+                self._dead_ends += 1
+            return self.make_lazy_weights(ws.cpu().numpy())
 
         @property
         def cache_stats(self) -> Dict[str, float]:
@@ -197,6 +221,9 @@ def _make_impl(base):
                 "eviction_rate": (self._evictions / looks) if looks else float("nan"),
                 "capacity": self._cache_max or None,
                 "high_water": len(self._cache),
+                # Not a cache figure, but reported with the run through the same dict: how many
+                # particles were stopped at a dead end rather than left to crash the sweep.
+                "dead_ends": self._dead_ends,
             }
 
         @property
