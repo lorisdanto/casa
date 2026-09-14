@@ -1,0 +1,50 @@
+"""Draw one index from a categorical given in log space, without the failure modes of
+``torch.multinomial``.
+
+Why this exists. On the CPU, ``torch.multinomial(p, 1)`` without replacement runs an exponential
+race: every entry is divided by an ``Exp(1)`` draw and the largest quotient wins. An exponential
+draw that comes back exactly zero turns its entry into infinity, and that entry wins whatever its
+probability was. Over a 128k-token vocabulary that is one uniformly random token roughly every
+hundred and thirty steps, which is invisible in a unit test on ten categories and ruinous in a
+forty-token answer: a fifth of the words MARS produced were outside the input list, its own
+accounting scored those sequences at a mean log-probability of -236, and the SMC baseline, which
+samples the identical ratios through numpy in float64, was clean.
+
+Inverse-CDF sampling in float64 has no such path. A zero-probability entry has the same cumulative
+value as its predecessor, so it can never be the first index whose cumulative value exceeds the
+uniform draw. The uniform comes from torch's global CPU generator, so seeding is unchanged.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def draw_log(log_weights: torch.Tensor) -> int:
+    """One index with probability proportional to ``exp(log_weights)``; ``-1`` if none is finite.
+
+    Entries at ``-inf`` have probability zero and are never returned. Normalization is implicit,
+    so the weights need not sum to one; MARS's bounds sum to at most one and rejection sampling
+    has already been paid for at expansion time, so what remains is a plain categorical.
+    """
+    lw = log_weights.detach().reshape(-1).to("cpu", torch.float64)
+    finite = torch.isfinite(lw)
+    if not bool(finite.any()):
+        return -1
+    shift = lw[finite].max()
+    probs = torch.where(finite, torch.exp(lw - shift), torch.zeros_like(lw))
+    cdf = torch.cumsum(probs, 0)
+    total = cdf[-1]
+    u = torch.rand((), dtype=torch.float64) * total  # in [0, total): rand() < 1
+    idx = int(torch.searchsorted(cdf, u.reshape(1), right=True))
+    if idx >= lw.shape[0] or probs[idx] <= 0.0:
+        # Reachable only by float rounding at the very top of the cdf; land on the last live entry
+        # rather than on a token the model gave no probability to.
+        idx = int(torch.nonzero(probs > 0.0)[-1])
+    return idx
+
+
+def draw_probs(probs: torch.Tensor) -> int:
+    """Same, from probabilities rather than log-weights. Zeros are never returned."""
+    p = probs.detach().reshape(-1).to("cpu", torch.float64)
+    return draw_log(torch.where(p > 0.0, torch.log(p), torch.full_like(p, float("-inf"))))

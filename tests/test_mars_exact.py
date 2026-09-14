@@ -153,9 +153,10 @@ def noise_floor(exact, n):
     return 0.5 * sum(math.sqrt(2 * p * (1 - p) / (math.pi * n)) for p in exact.values())
 
 
-def run(label, target, op, n=12_000, seed=0, slack=3.0, tables=None, post=None):
+def run(label, target, op, n=12_000, seed=0, slack=3.0, tables=None, post=None,
+        adaptive=True):
     torch.manual_seed(seed)
-    sampler = MARS(target, max_new_tokens=MAX_BODY + 1)
+    sampler = MARS(target, max_new_tokens=MAX_BODY + 1, adaptive=adaptive)
     results = sampler.sample("", n_samples=n, max_attempts=10_000)
 
     counts = Counter(tuple(r.token_ids[:-1]) for r in results)
@@ -198,9 +199,9 @@ def trie_inconsistencies(sampler, tol=1e-6):
         for tokid, child in node.children.items():
             if child.raw_logprob is None:
                 continue  # created but never expanded; the parent still holds the original bound
-            parent_says = float(torch.exp(node.log_theta[0, tokid]))
+            parent_says = float(torch.exp((node.log_theta[0, tokid] if node.log_theta is not None else torch.tensor(0.0))))
             child_total = float(torch.exp(torch.logsumexp(
-                child.raw_logprob[0] + child.log_theta[0], dim=0)))
+                child.raw_logprob[0] + (child.log_theta[0] if child.log_theta is not None else 0.0), dim=0)))
             if abs(parent_says - child_total) > tol * max(1.0, abs(child_total)):
                 bad.append((path + [tokid], parent_says, child_total))
             walk(child, path + [tokid])
@@ -341,6 +342,33 @@ def main():
           f"{len(got)}/20 samples, lengths {sorted(lens)}, "
           f"{stopper.stats.length_cutoffs} cutoffs")
     passed &= ok_stop
+
+    print("\nPlain rejection sampling: same target, nothing remembered")
+    # The non-adaptive mode must hit the same distribution. If it did not, the comparison between
+    # them would be measuring two different things and the speedup would be meaningless.
+    p = Model(FakeLLM(P_TABLE, tok), name="P")
+    r = Model(FakeLLM(R_TABLE, tok), name="R")
+    ok, rs = run("RS, intersect", intersect(p, r), lambda a, b: math.sqrt(a * b), adaptive=False)
+    passed &= ok
+
+    p = Model(FakeLLM(P_TABLE, tok), name="P")
+    r = Model(FakeLLM(R_TABLE, tok), name="R")
+    _, mars = run("MARS, intersect", intersect(p, r), lambda a, b: math.sqrt(a * b))
+    speedup = rs.stats.model_calls / max(mars.stats.model_calls, 1)
+    # Root mass is not the thing to check here: RS clears the trie before each descent, so what
+    # survives at the end describes only the final descent. What distinguishes them is whether
+    # cost grows with the number of descents. RS pays afresh every time; MARS pays once per
+    # prefix, so its calls stay flat however many samples are drawn.
+    rs_per_descent = rs.stats.model_calls / max(rs.stats.descents, 1)
+    mars_per_descent = mars.stats.model_calls / max(mars.stats.descents, 1)
+    print(f"         RS   {rs.stats.model_calls:>7} calls over {rs.stats.descents:>6} descents "
+          f"({rs_per_descent:5.2f} each)  acceptance {rs.acceptance_rate:.3f}")
+    print(f"         MARS {mars.stats.model_calls:>7} calls over {mars.stats.descents:>6} descents "
+          f"({mars_per_descent:5.3f} each)  acceptance {mars.acceptance_rate:.3f}")
+    amortizes = mars_per_descent < rs_per_descent / 10
+    print(f"  {'ok    ' if amortizes else 'FAIL  '}MARS amortizes, RS does not: "
+          f"{speedup:.0f}x fewer model calls for the same distribution")
+    passed &= amortizes
 
     print("\nTrie consistency: every parent's bound equals its child's total")
     for label, target, seed in [

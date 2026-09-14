@@ -95,18 +95,21 @@ class LLM:
 		
 		return cls(model=model, tokenizer=tokenizer, model_id=model_id, is_chat_model=is_chat_model)
 	
-	def format_prompt(self, prompt: str) -> str:
+	def format_prompt(self, prompt) -> str:
 		"""Format prompt based on model type (chat vs base).
-		
+
 		Args:
-			prompt: Raw prompt string.
-			
+			prompt: Either a raw string, treated as a single user turn, or a list of
+				``{"role": ..., "content": ...}`` messages. The list form is needed to reproduce
+				prompts that carry a system message or a worked exemplar as an assistant turn,
+				which is how the papers we compare against specify theirs.
+
 		Returns:
 			Formatted prompt string.
 		"""
 
 		if self.is_chat_model:
-			messages = [{"role": "user", "content": prompt}]
+			messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
 			formatted = self.tokenizer.apply_chat_template(
 				messages,
 				tokenize=False,
@@ -115,6 +118,8 @@ class LLM:
 			assert isinstance(formatted, str)
 			return formatted
 		else:
+			if isinstance(prompt, list):
+				return "".join(m["content"] for m in prompt)
 			return prompt
 	
 	def encode(self, text: str, return_tensors: str = "pt") -> torch.Tensor:

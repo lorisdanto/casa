@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 import torch
 
 from casa import envelope_runtime as rt
+from casa.draw import draw_log
 from casa.algebra import Envelope, Potential
 from casa.samplers.base import SamplingResult
 from casa.utils.helpers import print_progress
@@ -38,7 +39,7 @@ NEG_INF = float("-inf")
 #: than arithmetic. Summing a float32 log-softmax over a 150k vocabulary is off by around 5e-5 in
 #: either direction, fifty times a 1e-6 tolerance, so a tight threshold rejects every ordinary
 #: model on its first expansion. A genuine violation is a factor, not a fifth of a permille.
-_LOG_SLACK = math.log1p(1e-3)
+_LOG_SLACK = rt.LOG_SLACK  # one tolerance for both envelope conditions, defined with the runtime
 
 
 class MARS:
@@ -62,10 +63,18 @@ class MARS:
             conditioned on terminating within the bound, but every language model a few tokens
             into a sentence wants to keep going, so nearly every descent is wasted and a short
             bound can return nothing at all after doing all the work.
+        adaptive: Whether to keep what each rejection teaches.
+
+            ``False`` starts every descent from the original envelope, discarding the tightened
+            bounds. That is plain rejection sampling from the same envelope: same target, same
+            exactness, same per-descent behaviour, but nothing is remembered, so the acceptance
+            rate never moves. It is the baseline the adaptive claim is measured against, and the
+            only difference between the two is whether the trie survives a descent.
     """
 
     def __init__(self, target, max_new_tokens: int = 512, verbose: bool = False,
-                 temperature: float = 1.0, on_max_length: str = "stop"):
+                 temperature: float = 1.0, on_max_length: str = "stop",
+                 adaptive: bool = True):
         self.envelope: Envelope = target.envelope() if isinstance(target, Potential) else target
         if not isinstance(self.envelope, Envelope):
             raise TypeError(f"expected an Envelope or Potential, got {type(target).__name__}")
@@ -75,6 +84,7 @@ class MARS:
         if on_max_length not in ("stop", "discard"):
             raise ValueError(f"on_max_length must be 'stop' or 'discard', got {on_max_length!r}")
         self.on_max_length = on_max_length
+        self.adaptive = adaptive
         self.trie = Trie()
         self.stats = _Stats()
         self._key = None
@@ -83,6 +93,10 @@ class MARS:
         """Forget every bound learned so far and start from the original envelope."""
         self.trie = Trie()
         self.stats = _Stats()
+
+    @property
+    def is_adaptive(self) -> bool:
+        return self.adaptive
 
     @property
     def root_mass(self) -> float:
@@ -95,7 +109,9 @@ class MARS:
         root = self.trie.root
         if root.raw_logprob is None:
             return 1.0
-        return float(torch.exp(torch.logsumexp(root.raw_logprob[0] + root.log_theta[0], dim=0)))
+        bounds = (root.raw_logprob[0] if root.log_theta is None
+                  else root.raw_logprob[0] + root.log_theta[0])
+        return float(torch.exp(torch.logsumexp(bounds, dim=0)))
 
     # -- public ------------------------------------------------------------------------------
 
@@ -141,6 +157,10 @@ class MARS:
             got = None
             for _ in range(max_attempts):
                 attempts += 1
+                if not self.adaptive:
+                    # Forget everything learned. Each descent then faces the original envelope,
+                    # which is exactly plain rejection sampling.
+                    self.trie = Trie()
                 got = self._descend(fresh)
                 if got is not None:
                     break
@@ -216,7 +236,11 @@ class MARS:
                     )
 
                 node.raw_logprob = ratios.unsqueeze(0).cpu()
-                node.log_theta = torch.zeros(1, ratios.shape[-1])
+                # The correction vector is zero at every node until a propagation writes to it,
+                # and most nodes are never written to. Allocating it eagerly doubled the trie's
+                # memory, a megabyte per node at a 128k vocabulary, which is what exhausted a 48 GB
+                # job on the long, loose grammars. It is created on first write in `_propagate`.
+                node.log_theta = None
                 # The gap between envelope and target at this prefix is a function of the prefix,
                 # so compute it now, while the models are materialized, rather than forcing a
                 # forward pass every time a cached descent happens to end here.
@@ -240,14 +264,17 @@ class MARS:
                     self.stats.rejected_mass += max(0.0, 1.0 - math.exp(log_survival))
                     return None
 
-            bounds = node.raw_logprob[0] + node.log_theta[0]
+            bounds = (node.raw_logprob[0] if node.log_theta is None
+                      else node.raw_logprob[0] + node.log_theta[0])
             finite = torch.isfinite(bounds)
             if not finite.any():
                 self._propagate(node, depth, context)
                 self.stats.dead_ends += 1
                 return None
 
-            token = int(torch.multinomial(torch.softmax(bounds, dim=-1), 1))
+            # Not torch.multinomial: its CPU path can return an entry of negligible probability
+            # about once per 130 draws at this vocabulary size (see casa.draw).
+            token = draw_log(bounds)
 
             if token == state.eos_token_id:
                 # The envelope is exact on complete sequences, so there is nothing left to reject
@@ -300,9 +327,13 @@ class MARS:
             depth -= 1
             node = node.parent
         while depth > 0:
-            total = torch.logsumexp(node.raw_logprob[0] + node.log_theta[0], dim=0)
+            bounds = (node.raw_logprob[0] if node.log_theta is None
+                      else node.raw_logprob[0] + node.log_theta[0])
+            total = torch.logsumexp(bounds, dim=0)
             depth -= 1
             node = node.parent
+            if node.log_theta is None:
+                node.log_theta = torch.zeros(1, node.raw_logprob.shape[-1])
             node.log_theta[0, context[depth]] = total
 
     def _result(self, base: "rt.EnvelopeRT", context: List[int],

@@ -19,6 +19,7 @@ All models in one expression must share a tokenizer. That is checked when the ru
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -27,6 +28,12 @@ import torch
 from casa.algebra import Envelope, Mean, Model, Potential, Power, Product, Scorer
 
 NEG_INF = float("-inf")
+# Tolerance for the envelope conditions in float32. Summing a float32 log-softmax over a 128k
+# vocabulary is off by around 1e-5, and the difference of two such values at a leaf by about
+# the same, so a strict comparison would report violations that are rounding. One part in a
+# thousand is far above rounding and far below any real violation; the sampler uses the
+# same value at expansion.
+LOG_SLACK = math.log1p(1e-3)
 
 
 class TokenizerMismatch(Exception):
@@ -122,7 +129,11 @@ class ModelRT(NodeRT):
             self._log_weight = float(rows.gather(1, idx).sum())
         else:
             self._log_weight = 0.0
-        self._log_cond = lp[-1]
+        # Clone, do not keep a view. `lp` is the full [sequence, vocabulary] logits, and a row of
+        # it retains the entire storage: 88 MiB per prefix at a 128k vocabulary instead of 0.5 MiB.
+        # Held across a few hundred cached prefixes that is tens of gigabytes, which is exactly how
+        # an 8B model filled a 44 GiB card.
+        self._log_cond = lp[-1].clone()
 
     def log_weight(self) -> float:
         if not self.context:
@@ -396,12 +407,14 @@ class EnvelopeRT:
             true = _true_next(self.root)
             env = self.root.log_next()
             gap += float(true[token]) - float(env[token])
-        if gap > 1e-6:
+        if gap > LOG_SLACK:
             raise ValueError(
                 f"the envelope is below the target at a complete sequence (by {gap:.9f} in log "
                 "space), so it does not dominate and no acceptance probability exists. This is a "
                 "violation of condition (i)."
             )
+        # Within the slack the envelope equals the target up to rounding: accept with probability
+        # one. A strict 1e-6 here failed 20 of 50 maximum-ensemble shards on gaps of 4e-6 to 3e-5.
         return min(gap, 0.0)
 
     def advance(self, token: int) -> "EnvelopeRT":
@@ -463,9 +476,15 @@ class Plan:
     temperature: float
     _dominating: bool = False
 
-    def fresh(self) -> EnvelopeRT:
+    def fresh(self, counters: Optional[Dict[int, Dict[str, int]]] = None) -> EnvelopeRT:
+        """A runtime at the empty prefix.
+
+        Pass ``counters`` to share model-call accounting across several runtimes. Anything that
+        builds a runtime per prefix, as the genlm bridge does, otherwise counts each one separately
+        and reports a total far below what was actually spent.
+        """
         built: List[ModelRT] = []
-        counters: Dict[int, Dict[str, int]] = {}
+        counters = {} if counters is None else counters
         leaf: List[Scorer] = []
 
         def go(node: Potential) -> NodeRT:
@@ -598,11 +617,27 @@ class _RecognizerMask:
             self._path = []
         if len(context) > len(self._path):
             if not self.rec.try_advance_token_ids(torch.tensor(context)):
-                raise ValueError(
-                    f"grammar {self.name!r} rejected a prefix MARS had already accepted. The "
-                    "recognizer and the sampler have disagreed about validity, which should be "
-                    "impossible: the mask is what chose every token on this path."
-                )
+                # The incremental extension failed. Before concluding that the recognizer and
+                # the sampler disagree, rule out the recognizer standing somewhere other than
+                # where `_path` says: anything else that touched it, a validity check on a sample
+                # or another user of the same grammar, moves it without updating `_path`. A clean
+                # replay from the root is the ground truth for this prefix.
+                self.rec.reset()
+                if self.rec.try_advance_token_ids(torch.tensor(context)):
+                    warnings.warn(
+                        f"grammar {self.name!r}: the recognizer had drifted from the path the mask "
+                        "tracked (it accepted the prefix on a clean replay but not incrementally); "
+                        "recovered by replaying from the root."
+                    )
+                else:
+                    consumed = getattr(self.rec, "current_index", None)
+                    raise ValueError(
+                        f"grammar {self.name!r} rejected a prefix MARS had already accepted, even "
+                        f"on a clean replay from the root: it consumed {consumed} of "
+                        f"{len(context)} tokens of {list(context)}. The recognizer and the sampler "
+                        "have disagreed about validity, which should be impossible: the mask is "
+                        "what chose every token on this path."
+                    )
             self._path = list(context)
 
     def __call__(self, context: Sequence[int], vocab_size: int) -> torch.Tensor:
