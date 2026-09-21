@@ -154,9 +154,9 @@ def noise_floor(exact, n):
 
 
 def run(label, target, op, n=12_000, seed=0, slack=3.0, tables=None, post=None,
-        adaptive=True):
+        adaptive=True, cache=False):
     torch.manual_seed(seed)
-    sampler = MARS(target, max_new_tokens=MAX_BODY + 1, adaptive=adaptive)
+    sampler = MARS(target, max_new_tokens=MAX_BODY + 1, adaptive=adaptive, cache=cache)
     results = sampler.sample("", n_samples=n, max_attempts=10_000)
 
     counts = Counter(tuple(r.token_ids[:-1]) for r in results)
@@ -369,6 +369,54 @@ def main():
     print(f"  {'ok    ' if amortizes else 'FAIL  '}MARS amortizes, RS does not: "
           f"{speedup:.0f}x fewer model calls for the same distribution")
     passed &= amortizes
+
+    print("\nCached rejection sampling: MARS's cache, none of its learning")
+    # The baseline that separates what the learned bounds buy from what caching buys. It must hit
+    # the same distribution, pay per prefix rather than per descent, and never tighten a bound, so
+    # its acceptance rate stays where plain rejection sampling's is.
+    cached = {}
+    for label, make, op in [
+        ("RS+cache, intersect", lambda a, b: intersect(a, b), lambda a, b: math.sqrt(a * b)),
+        ("RS+cache, max, leaf rej.", lambda a, b: mean([a, b], tau=math.inf), max),
+    ]:
+        p = Model(FakeLLM(P_TABLE, tok), name="P")
+        r = Model(FakeLLM(R_TABLE, tok), name="R")
+        ok, cached[label] = run(label, make(p, r), op, adaptive=False, cache=True)
+        passed &= ok
+    rsc = cached["RS+cache, intersect"]
+    rsc_per_descent = rsc.stats.model_calls / max(rsc.stats.descents, 1)
+    ok_cost = rsc_per_descent < rs_per_descent / 10
+    print(f"  {'ok    ' if ok_cost else 'FAIL  '}RS+cache pays per prefix: "
+          f"{rsc_per_descent:.3f} calls per descent against RS's {rs_per_descent:.2f}")
+    passed &= ok_cost
+    ok_flat = (abs(rsc.acceptance_rate - rs.acceptance_rate) < 0.03
+               and rsc.acceptance_rate < mars.acceptance_rate - 0.05
+               and rsc.trie.root.log_theta is None)
+    print(f"  {'ok    ' if ok_flat else 'FAIL  '}RS+cache learns nothing: acceptance "
+          f"{rsc.acceptance_rate:.3f} (RS {rs.acceptance_rate:.3f}, MARS {mars.acceptance_rate:.3f})")
+    passed &= ok_flat
+    # Stronger than matching the distribution: the cache changes only where the ratios come from,
+    # never which coins are flipped, so under one seed it must draw the very same samples as RS.
+    draws = []
+    for cache in (False, True):
+        torch.manual_seed(7)
+        s_ = MARS(mean([Model(FakeLLM(P_TABLE, tok), name="P"),
+                        Model(FakeLLM(R_TABLE, tok), name="R")], tau=math.inf),
+                  max_new_tokens=MAX_BODY + 1, adaptive=False, cache=cache)
+        draws.append(([tuple(x.token_ids) for x in s_.sample("", n_samples=500,
+                                                             max_attempts=10_000)],
+                      s_.stats.descents, s_.stats.model_calls))
+    ok_same = draws[0][:2] == draws[1][:2] and draws[1][2] < draws[0][2]
+    print(f"  {'ok    ' if ok_same else 'FAIL  '}same seed, same draws as RS: "
+          f"{draws[1][1]} descents both, calls {draws[0][2]} -> {draws[1][2]}")
+    passed &= ok_same
+    try:
+        MARS(intersect(Model(FakeLLM(P_TABLE, tok), name="P"),
+                       Model(FakeLLM(R_TABLE, tok), name="R")), cache=True)
+        print("  FAIL   cache=True with adaptive=True was accepted")
+        passed = False
+    except ValueError:
+        print("  ok     cache=True requires adaptive=False")
 
     print("\nTrie consistency: every parent's bound equals its child's total")
     for label, target, seed in [

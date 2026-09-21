@@ -70,11 +70,17 @@ class MARS:
             exactness, same per-descent behaviour, but nothing is remembered, so the acceptance
             rate never moves. It is the baseline the adaptive claim is measured against, and the
             only difference between the two is whether the trie survives a descent.
+        cache: With ``adaptive=False`` only: keep every expanded prefix's envelope ratios across
+            descents, but never tighten a bound. That is rejection sampling with the same prefix
+            cache MARS has, so a revisited prefix costs no forward pass, and the survival coin is
+            flipped again from the stored ratios on every visit, as plain rejection sampling
+            would flip it. Against MARS this isolates what the learned bounds buy from what the
+            cache buys; on a target that never rejects the two are the same algorithm.
     """
 
     def __init__(self, target, max_new_tokens: int = 512, verbose: bool = False,
                  temperature: float = 1.0, on_max_length: str = "stop",
-                 adaptive: bool = True):
+                 adaptive: bool = True, cache: bool = False):
         self.envelope: Envelope = target.envelope() if isinstance(target, Potential) else target
         if not isinstance(self.envelope, Envelope):
             raise TypeError(f"expected an Envelope or Potential, got {type(target).__name__}")
@@ -84,7 +90,11 @@ class MARS:
         if on_max_length not in ("stop", "discard"):
             raise ValueError(f"on_max_length must be 'stop' or 'discard', got {on_max_length!r}")
         self.on_max_length = on_max_length
+        if cache and adaptive:
+            raise ValueError("cache=True is rejection sampling with a prefix cache; MARS already "
+                             "keeps its trie, so pass adaptive=False with it")
         self.adaptive = adaptive
+        self.cache = cache
         self.trie = Trie()
         self.stats = _Stats()
         self._key = None
@@ -157,7 +167,7 @@ class MARS:
             got = None
             for _ in range(max_attempts):
                 attempts += 1
-                if not self.adaptive:
+                if not self.adaptive and not self.cache:
                     # Forget everything learned. Each descent then faces the original envelope,
                     # which is exactly plain rejection sampling.
                     self.trie = Trie()
@@ -236,6 +246,9 @@ class MARS:
                     )
 
                 node.raw_logprob = ratios.unsqueeze(0).cpu()
+                # Kept so that cached rejection sampling can flip this coin again on a revisit
+                # without recomputing it. MARS never reads it: after propagation the coin is gone.
+                node.log_survival = log_survival
                 # The correction vector is zero at every node until a propagation writes to it,
                 # and most nodes are never written to. Allocating it eagerly doubled the trie's
                 # memory, a megabyte per node at a 128k vocabulary, which is what exhausted a 48 GB
@@ -260,6 +273,17 @@ class MARS:
                     return None
                 if log_survival < 0.0 and math.log(max(torch.rand(()).item(), 1e-300)) > log_survival:
                     self._propagate(node, depth, context)
+                    self.stats.rejections += 1
+                    self.stats.rejected_mass += max(0.0, 1.0 - math.exp(log_survival))
+                    return None
+            elif self.cache:
+                # A cached prefix under rejection sampling: nothing was learned here, so the
+                # descent faces the same survival coin it faced on the first visit.
+                log_survival = node.log_survival
+                if math.isnan(log_survival) or log_survival == NEG_INF:
+                    self.stats.dead_ends += 1
+                    return None
+                if log_survival < 0.0 and math.log(max(torch.rand(()).item(), 1e-300)) > log_survival:
                     self.stats.rejections += 1
                     self.stats.rejected_mass += max(0.0, 1.0 - math.exp(log_survival))
                     return None
@@ -320,6 +344,9 @@ class MARS:
         because ``raw_logprob`` already holds the full envelope ratio, so the parent's entry for
         this child is its bound and nothing else.
         """
+        if self.cache:
+            # Rejection sampling learns nothing; the cache keeps ratios, never tightened bounds.
+            return
         # A node created but never expanded holds no bound of its own; its parent's entry for it
         # is still the original envelope value, so there is nothing to push up from it. This
         # happens whenever a descent stops on the length bound.
