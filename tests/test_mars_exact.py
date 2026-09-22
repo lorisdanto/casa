@@ -234,17 +234,22 @@ def main():
     ok, _ = run("agree, min(P,R)", p & r, min)
     passed &= ok
 
-    # Coverage, which needs the dominating mixture and a leaf acceptance step.
+    # Coverage, which starts from the dominating mixture and so is loose at the leaves. The gap
+    # must be folded into the trie at the expansion, not flipped for at the leaf: that is the only
+    # slack this regime has, because the mixture is tight at every interior prefix.
     p = Model(FakeLLM(P_TABLE, tok), name="P")
     r = Model(FakeLLM(R_TABLE, tok), name="R")
-    ok, s_max = run("max(P,R), leaf rejection", mean([p, r], tau=math.inf), max)
+    ok, s_max = run("max(P,R), leaf gap folded in", mean([p, r], tau=math.inf), max)
     passed &= ok
-    if s_max.stats.leaf_trials == 0:
-        print("  FAIL   coverage regime never exercised the leaf acceptance step")
+    if s_max.stats.leaf_tightenings == 0:
+        print("  FAIL   coverage regime never tightened a leaf bound")
+        passed = False
+    elif s_max.root_mass >= 1.0:
+        print(f"  FAIL   coverage regime learned nothing: root mass still {s_max.root_mass:.6f}")
         passed = False
     else:
-        print(f"         leaf acceptance exercised: {s_max.stats.leaf_rejections}"
-              f"/{s_max.stats.leaf_trials} rejected")
+        print(f"         leaf bounds tightened at {s_max.stats.leaf_tightenings} expansions; "
+              f"root mass fell to {s_max.root_mass:.4f}")
 
     # Mixture, tau = 1, an envelope with no leaf step.
     p = Model(FakeLLM(P_TABLE, tok), name="P")
@@ -313,7 +318,7 @@ def main():
                 lambda a, b: a * a * b, tables=(P_TABLE, mask_table_for_scorer))
     passed &= ok
 
-    print("\nOutput-only verifier: scored at the leaf, never in the trie")
+    print("\nOutput-only verifier: scored at the prefix it completes, then folded into the trie")
 
     def verifier(ctx):
         # Depends on the whole sequence, so it cannot tighten any prefix bound.
@@ -323,12 +328,12 @@ def main():
     ok, ver = run("P reweighted by a verifier", reweight(p, verifier, prefix_monotone=False),
                   lambda a, b: a, tables=(P_TABLE, P_TABLE), post=verifier)
     passed &= ok
-    if ver.stats.leaf_trials == 0:
+    if ver.stats.leaf_tightenings == 0:
         print("  FAIL   the verifier was never consulted")
         passed = False
     else:
-        print(f"         consulted at {ver.stats.leaf_trials} leaves, "
-              f"{ver.stats.leaf_rejections} rejected")
+        print(f"         consulted at {ver.stats.leaf_tightenings} expansions, "
+              f"root mass {ver.root_mass:.4f}")
 
     print("\nForced termination at the bound is the default")
     torch.manual_seed(6)

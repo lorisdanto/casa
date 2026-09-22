@@ -15,7 +15,12 @@ Two consequences worth knowing. A rejection can now be partial: where CARS disco
 continuation by drawing it, MARS flips one coin at the moment a prefix is first expanded, with
 survival probability equal to the total child mass over the parent's bound, and never draws the
 token at all. And no rejection ever happens at a leaf, because the envelope is exact on complete
-sequences, so once a descent reaches the end-of-sequence token the sample is accepted.
+sequences, so once a descent reaches the end-of-sequence token the sample is accepted. Where the
+envelope does not start out exact at leaves -- the coverage regime, and any output-only scorer --
+MARS tightens the bound on the stop token to the target's own weight, which is known at the prefix
+it completes, rather than leaving a gap to be flipped for at the leaf. Both orders are exact and
+cost the same forward passes; only this one leaves a tightened bound behind, which is why the
+baselines keep the coin.
 """
 
 from __future__ import annotations
@@ -245,6 +250,45 @@ class MARS:
                         "it would not be exact."
                     )
 
+                # The gap between envelope and target at this prefix's complete sequence is a
+                # function of the prefix, so it is known here, at the expansion, while the models
+                # are materialized -- before the leaf is ever drawn. Computing it here is what
+                # keeps a revisited prefix free for every sampler: the gap is a forward pass, and
+                # caching it is caching that pass, which the baselines get as much as MARS does.
+                #
+                # What to do with it is where they part. MARS folds it into the bound on the stop
+                # token, which restores condition (i) at this leaf, removes the need for any
+                # acceptance step there, and -- the point -- charges the slack to the survival
+                # coin below, from where `_propagate` carries it to the ancestors like any other
+                # tightening. Held back at the leaf instead, this slack is learned from never. In
+                # the coverage regime (a mean at tau > 1) that is the whole of it: MARS runs there
+                # on the dominating mixture, which meets condition (ii) with equality at every
+                # interior prefix, so every bit of envelope slack sits at the leaves. Leaving it
+                # there makes the root mass constant and MARS no better than RS on the mixture.
+                #
+                # The baselines must not fold it, because a folded gap is a bound that stays
+                # tightened for every later descent, and not learning is the whole of what they
+                # are. They keep the coin at the leaf, re-flipped per descent off the cached gap.
+                # Per descent the two are the same draw -- the fold moves a rejection from the
+                # leaf up to the prefix it belongs to, and leaves the probability of reaching any
+                # other child untouched -- so what separates the samplers is propagation alone.
+                gap = 0.0
+                if self.envelope.needs_leaf_rejection:
+                    # `at_bound`: stopped here, so the sequence's weight is this prefix's weight,
+                    # not the weight of this prefix followed by the marker.
+                    gap = (state.log_truncation_acceptance() if at_bound
+                           else state.log_leaf_acceptance(state.eos_token_id))
+                node.leaf_gap = gap
+                if gap < 0.0 and self.adaptive:
+                    # `log_ratios` builds a fresh tensor per call, but copy anyway: writing
+                    # through to a vector the runtime might one day cache would corrupt the
+                    # bounds of every later prefix.
+                    ratios = ratios.clone()
+                    ratios[state.eos_token_id] += gap
+                    log_survival = float(torch.logsumexp(ratios.double(), dim=0))
+                    node.leaf_gap = 0.0   # it is in the bound now; nothing left to pay at the leaf
+                    self.stats.leaf_tightenings += 1
+
                 node.raw_logprob = ratios.unsqueeze(0).cpu()
                 # Kept so that cached rejection sampling can flip this coin again on a revisit
                 # without recomputing it. MARS never reads it: after propagation the coin is gone.
@@ -254,17 +298,6 @@ class MARS:
                 # memory, a megabyte per node at a 128k vocabulary, which is what exhausted a 48 GB
                 # job on the long, loose grammars. It is created on first write in `_propagate`.
                 node.log_theta = None
-                # The gap between envelope and target at this prefix is a function of the prefix,
-                # so compute it now, while the models are materialized, rather than forcing a
-                # forward pass every time a cached descent happens to end here.
-                if not self.envelope.needs_leaf_rejection:
-                    node.leaf_gap = 0.0
-                elif at_bound:
-                    # Stopped here, so the sequence's weight is this prefix's weight, not the
-                    # weight of this prefix followed by the marker.
-                    node.leaf_gap = state.log_truncation_acceptance()
-                else:
-                    node.leaf_gap = state.log_leaf_acceptance(state.eos_token_id)
                 self.stats.expansions += 1
                 pending = True
                 if math.isnan(log_survival) or log_survival == NEG_INF:
@@ -314,15 +347,18 @@ class MARS:
                 token = draw_log(bounds)
 
             if token == state.eos_token_id:
-                # The envelope is exact on complete sequences, so there is nothing left to reject
-                # unless the target needed a dominating envelope in the first place.
-                log_acc = 0.0
-                if self.envelope.needs_leaf_rejection:
-                    log_acc = getattr(node, "leaf_gap", None)
-                    if log_acc is None:  # node predates the cache; pay for it once
-                        log_acc = state.log_leaf_acceptance(token)
+                # The envelope is exact on complete sequences, so there is nothing left to reject.
+                # Under MARS that holds for a dominating envelope too: the expansion folded the
+                # gap into the bound stored here, `leaf_gap` is zero, and the rejection it stands
+                # for was already paid, as a lower survival probability, at the prefix. A baseline
+                # did not fold, and pays it here, from the cached gap and with no forward pass.
+                # Read the attribute, do not default it: every expansion sets it, and a node
+                # that was never expanded cannot be drawn from. Defaulting to zero here would
+                # skip a baseline's acceptance step in silence, which is a bias, not a crash.
+                log_acc = node.leaf_gap
+                if log_acc < 0.0:
                     self.stats.leaf_trials += 1
-                    if log_acc < 0.0 and math.log(max(torch.rand(()).item(), 1e-300)) > log_acc:
+                    if math.log(max(torch.rand(()).item(), 1e-300)) > log_acc:
                         # Propagate before giving up. An expansion made during this descent has
                         # tightened a bound, and leaving that out of the ancestors would let the
                         # parent keep over-weighting this subtree with no rejection to pay for it,
@@ -380,11 +416,13 @@ class MARS:
                 log_ratio_sum: float, log_leaf_gap: float = 0.0) -> SamplingResult:
         """Package a yielded sequence.
 
-        ``raw_logprob`` is ``log phi(w$)``, the target's own unnormalized weight. The ratios stored
-        in the trie telescope to ``log E(w$)``, which equals it by condition (i) for every target
-        except the coverage regime, where MARS runs on a dominating envelope; there the difference
-        is the leaf gap, which varies from sequence to sequence and is added back here. Getting
-        that wrong makes every reweighting or divergence computed from these numbers wrong too.
+        ``raw_logprob`` is ``log phi(w$)``, the target's own unnormalized weight. The ratios
+        stored in the trie telescope to ``log E(w$)``, which equals it by condition (i). In the
+        coverage regime the envelope starts out dominating, for which that would not hold; MARS
+        tightens the bound on each stop token to the target's own weight as it expands, so the sum
+        needs no correction, while a baseline leaves the difference at the leaf and it is added
+        back here. Getting that wrong makes every reweighting or divergence computed from these
+        numbers wrong too.
 
         ``constrained_logprob`` is the same quantity relative to the envelope at the root. Note
         that CARS puts the descent's own log-probability in this field, which is a different thing:
@@ -410,7 +448,8 @@ class _Stats:
     """What a run cost, in the quantities the theory talks about."""
 
     __slots__ = ("descents", "accepted", "expansions", "rejections", "rejected_mass",
-                 "leaf_trials", "leaf_rejections", "dead_ends", "length_cutoffs",
+                 "leaf_tightenings", "leaf_trials", "leaf_rejections",
+                 "dead_ends", "length_cutoffs",
                  "timeouts", "seconds", "model_calls")
 
     def __init__(self):
@@ -419,6 +458,9 @@ class _Stats:
         self.expansions = 0
         self.rejections = 0
         self.rejected_mass = 0.0
+        # Expansions at which a dominating envelope's leaf gap was folded into the bound
+        # (MARS), against leaves where it was paid as a coin flip instead (the baselines).
+        self.leaf_tightenings = 0
         self.leaf_trials = 0
         self.leaf_rejections = 0
         self.dead_ends = 0

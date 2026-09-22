@@ -260,7 +260,7 @@ budget = 2 * perf.stats.expansions + 8
 check("model calls stay proportional to expansions, not to leaves",
       perf.stats.model_calls <= budget,
       f"{perf.stats.model_calls} calls, {perf.stats.expansions} expansions, "
-      f"{perf.stats.leaf_trials} leaf trials, budget {budget}")
+      f"{perf.stats.leaf_tightenings} leaf tightenings, budget {budget}")
 
 print("\nA recognizer left mid-path by a previous run must be rewound")
 
