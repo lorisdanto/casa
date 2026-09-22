@@ -27,7 +27,7 @@ from typing import Dict, List, Optional
 import torch
 
 from casa import envelope_runtime as rt
-from casa.draw import draw_log
+from casa.draw import draw_log, draw_prepared, prepare_log
 from casa.algebra import Envelope, Potential
 from casa.samplers.base import SamplingResult
 from casa.utils.helpers import print_progress
@@ -288,17 +288,30 @@ class MARS:
                     self.stats.rejected_mass += max(0.0, 1.0 - math.exp(log_survival))
                     return None
 
-            bounds = (node.raw_logprob[0] if node.log_theta is None
-                      else node.raw_logprob[0] + node.log_theta[0])
-            finite = torch.isfinite(bounds)
-            if not finite.any():
-                self._propagate(node, depth, context)
-                self.stats.dead_ends += 1
-                return None
+            if self.cache:
+                # Under cached rejection sampling a node's bounds never change, so the cumulative
+                # table is built on the first visit and every revisit is one uniform and a binary
+                # search, instead of a float64 pass over the vocabulary. Same draw, uniform for
+                # uniform; without this a timed-out instance spends minutes of CPU on revisits.
+                prepared = getattr(node, "prepared", None)
+                if prepared is None:
+                    prepared = node.prepared = prepare_log(node.raw_logprob[0]) or False
+                if prepared is False:
+                    self.stats.dead_ends += 1
+                    return None
+                token = draw_prepared(prepared)
+            else:
+                bounds = (node.raw_logprob[0] if node.log_theta is None
+                          else node.raw_logprob[0] + node.log_theta[0])
+                finite = torch.isfinite(bounds)
+                if not finite.any():
+                    self._propagate(node, depth, context)
+                    self.stats.dead_ends += 1
+                    return None
 
-            # Not torch.multinomial: its CPU path can return an entry of negligible probability
-            # about once per 130 draws at this vocabulary size (see casa.draw).
-            token = draw_log(bounds)
+                # Not torch.multinomial: its CPU path can return an entry of negligible
+                # probability about once per 130 draws at this vocabulary size (see casa.draw).
+                token = draw_log(bounds)
 
             if token == state.eos_token_id:
                 # The envelope is exact on complete sequences, so there is nothing left to reject

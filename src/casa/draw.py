@@ -27,19 +27,31 @@ def draw_log(log_weights: torch.Tensor) -> int:
     so the weights need not sum to one; MARS's bounds sum to at most one and rejection sampling
     has already been paid for at expansion time, so what remains is a plain categorical.
     """
+    prepared = prepare_log(log_weights)
+    return -1 if prepared is None else draw_prepared(prepared)
+
+
+def prepare_log(log_weights: torch.Tensor):
+    """The cumulative table :func:`draw_prepared` samples from, or ``None`` if nothing is finite.
+
+    Split out so a caller drawing repeatedly from weights that never change can pay for the
+    full-vocabulary pass once. The draw is the same one :func:`draw_log` makes, uniform for uniform.
+    """
     lw = log_weights.detach().reshape(-1).to("cpu", torch.float64)
     finite = torch.isfinite(lw)
     if not bool(finite.any()):
-        return -1
+        return None
     shift = lw[finite].max()
     probs = torch.where(finite, torch.exp(lw - shift), torch.zeros_like(lw))
-    cdf = torch.cumsum(probs, 0)
+    return torch.cumsum(probs, 0), probs
+
+
+def draw_prepared(prepared) -> int:
+    cdf, probs = prepared
     total = cdf[-1]
     u = torch.rand((), dtype=torch.float64) * total  # in [0, total): rand() < 1
     idx = int(torch.searchsorted(cdf, u.reshape(1), right=True))
-    if idx >= lw.shape[0] or probs[idx] <= 0.0:
-        # Reachable only by float rounding at the very top of the cdf; land on the last live entry
-        # rather than on a token the model gave no probability to.
+    if idx >= cdf.shape[0] or probs[idx] <= 0.0:
         idx = int(torch.nonzero(probs > 0.0)[-1])
     return idx
 
